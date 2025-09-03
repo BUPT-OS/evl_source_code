@@ -20,6 +20,7 @@
 #include <linux/io-64-nonatomic-lo-hi.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/irqstage.h>
 #include <linux/of.h>
 #include <linux/of_dma.h>
 #include <linux/platform_device.h>
@@ -369,8 +370,8 @@ dma_chan_tx_status(struct dma_chan *dchan, dma_cookie_t cookie,
 	if (status == DMA_COMPLETE || !txstate)
 		return status;
 
-	spin_lock_irqsave(&chan->vc.lock, flags);
-
+	// spin_lock_irqsave(&chan->vc.lock, flags);
+	vchan_lock_irqsave(&chan->vc,flags);
 	vdesc = vchan_find_desc(&chan->vc, cookie);
 	if (vdesc) {
 		length = vd_to_axi_desc(vdesc)->length;
@@ -380,7 +381,8 @@ dma_chan_tx_status(struct dma_chan *dchan, dma_cookie_t cookie,
 		bytes = length - completed_length;
 	}
 
-	spin_unlock_irqrestore(&chan->vc.lock, flags);
+	// spin_unlock_irqrestore(&chan->vc.lock, flags);
+	vchan_unlock_irqrestore(&chan->vc,flags);
 	dma_set_residue(txstate, bytes);
 
 	return status;
@@ -480,6 +482,11 @@ static void axi_chan_block_xfer_start(struct axi_dma_chan *chan,
 	axi_chan_enable(chan);
 }
 
+static inline bool dw_axi_dma_oob_capable(void)
+{
+       return IS_ENABLED(CONFIG_DW_AXI_DMAC_OOB);
+}
+
 static void axi_chan_start_first_queued(struct axi_dma_chan *chan)
 {
 	struct axi_dma_desc *desc;
@@ -492,7 +499,11 @@ static void axi_chan_start_first_queued(struct axi_dma_chan *chan)
 	desc = vd_to_axi_desc(vd);
 	dev_vdbg(chan2dev(chan), "%s: started %u\n", axi_chan_name(chan),
 		vd->tx.cookie);
-	axi_chan_block_xfer_start(chan, desc);
+	// axi_chan_block_xfer_start(chan, desc);
+	//filter the desc:ib context OR non-oob desc
+    if(!dw_axi_dma_oob_capable() || !vchan_oob_pulsed(vd))
+    	axi_chan_block_xfer_start(chan, desc);
+
 }
 
 static void dma_chan_issue_pending(struct dma_chan *dchan)
@@ -500,11 +511,36 @@ static void dma_chan_issue_pending(struct dma_chan *dchan)
 	struct axi_dma_chan *chan = dchan_to_axi_dma_chan(dchan);
 	unsigned long flags;
 
-	spin_lock_irqsave(&chan->vc.lock, flags);
+	// spin_lock_irqsave(&chan->vc.lock, flags);
+	vchan_lock_irqsave(&chan->vc,flags);
 	if (vchan_issue_pending(&chan->vc))
 		axi_chan_start_first_queued(chan);
-	spin_unlock_irqrestore(&chan->vc.lock, flags);
+	// spin_unlock_irqrestore(&chan->vc.lock, flags);
+	vchan_unlock_irqrestore(&chan->vc,flags);
 }
+
+#ifdef CONFIG_DW_AXI_DMAC_OOB
+static int dw_axi_dma_pulse_oob(struct dma_chan *dchan)
+{
+	struct axi_dma_chan *chan = dchan_to_axi_dma_chan(dchan);
+	unsigned long flags;
+	int ret = -EIO;
+
+	vchan_lock_irqsave(&chan->vc, flags);
+	if (chan->desc && vchan_oob_pulsed(&chan->desc->vd)) {
+		axi_chan_block_xfer_start(chan,chan->desc);
+		ret = 0;
+	}
+	vchan_unlock_irqrestore(&chan->vc, flags);
+
+	return ret;
+}
+#else
+static int dw_axi_dma_pulse_oob(struct dma_chan *dchan)
+{
+	return -ENOTSUPP;
+}
+#endif
 
 static void dw_axi_dma_synchronize(struct dma_chan *dchan)
 {
@@ -779,6 +815,22 @@ dw_axi_dma_chan_prep_cyclic(struct dma_chan *dchan, dma_addr_t dma_addr,
 	u64 llp = 0;
 	u8 lms = 0; /* Select AXI0 master for LLI fetching */
 
+	//check flags
+	if(!dw_axi_dma_oob_capable()) {
+		if (flags & DMA_OOB_INTERRUPT) {
+				dev_err(dchan2dev(dchan),
+						"%s: out-of-band cyclic transfers disabled\n",
+						__func__);
+				return NULL;
+		}
+	} else if(flags & DMA_OOB_PULSE) {
+		dev_err(dchan2dev(dchan),
+				"%s: no pulse mode with out-of-band cyclic transfers\n",
+				__func__);
+		return NULL;
+	}
+
+
 	num_periods = buf_len / period_len;
 
 	axi_block_len = calculate_block_len(chan, dma_addr, buf_len, direction);
@@ -856,6 +908,15 @@ dw_axi_dma_chan_prep_slave_sg(struct dma_chan *dchan, struct scatterlist *sgl,
 	int status;
 	u64 llp = 0;
 	u8 lms = 0; /* Select AXI0 master for LLI fetching */
+
+	if(!dw_axi_dma_oob_capable()) {
+		if(flags & (DMA_OOB_INTERRUPT|DMA_OOB_PULSE)) {
+			dev_err(dchan2dev(dchan),
+					"%s: out-of-band slave transfers disabled\n",
+					__func__);
+			return NULL;
+		}
+	}
 
 	if (unlikely(!is_slave_direction(direction) || !sg_len))
 		return NULL;
@@ -1063,8 +1124,8 @@ static noinline void axi_chan_handle_err(struct axi_dma_chan *chan, u32 status)
 	struct virt_dma_desc *vd;
 	unsigned long flags;
 
-	spin_lock_irqsave(&chan->vc.lock, flags);
-
+	// spin_lock_irqsave(&chan->vc.lock, flags);
+	vchan_lock_irqsave(&chan->vc, flags);
 	axi_chan_disable(chan);
 
 	/* The bad descriptor currently is in the head of vc list */
@@ -1089,7 +1150,8 @@ static noinline void axi_chan_handle_err(struct axi_dma_chan *chan, u32 status)
 	axi_chan_start_first_queued(chan);
 
 out:
-	spin_unlock_irqrestore(&chan->vc.lock, flags);
+	// spin_unlock_irqrestore(&chan->vc.lock, flags);
+	vchan_unlock_irqrestore(&chan->vc, flags);
 }
 
 static void axi_chan_block_xfer_complete(struct axi_dma_chan *chan)
@@ -1102,7 +1164,8 @@ static void axi_chan_block_xfer_complete(struct axi_dma_chan *chan)
 	u64 llp;
 	int i;
 
-	spin_lock_irqsave(&chan->vc.lock, flags);
+	// spin_lock_irqsave(&chan->vc.lock, flags);
+	vchan_lock_irqsave(&chan->vc, flags);
 	if (unlikely(axi_chan_is_hw_enable(chan))) {
 		dev_err(chan2dev(chan), "BUG: %s caught DWAXIDMAC_IRQ_DMA_TRF, but channel not idle!\n",
 			axi_chan_name(chan));
@@ -1143,7 +1206,8 @@ static void axi_chan_block_xfer_complete(struct axi_dma_chan *chan)
 	}
 
 out:
-	spin_unlock_irqrestore(&chan->vc.lock, flags);
+	// spin_unlock_irqrestore(&chan->vc.lock, flags);
+	vchan_unlock_irqrestore(&chan->vc, flags);
 }
 
 static irqreturn_t dw_axi_dma_interrupt(int irq, void *dev_id)
@@ -1200,13 +1264,13 @@ static int dma_chan_terminate_all(struct dma_chan *dchan)
 	if (chan->direction == DMA_MEM_TO_DEV)
 		dw_axi_dma_set_byte_halfword(chan, false);
 
-	spin_lock_irqsave(&chan->vc.lock, flags);
-
+	// spin_lock_irqsave(&chan->vc.lock, flags);
+	vchan_lock_irqsave(&chan->vc, flags);
 	vchan_get_all_descriptors(&chan->vc, &head);
 
 	chan->cyclic = false;
-	spin_unlock_irqrestore(&chan->vc.lock, flags);
-
+	// spin_unlock_irqrestore(&chan->vc.lock, flags);
+	vchan_unlock_irqrestore(&chan->vc, flags);
 	vchan_dma_desc_free_list(&chan->vc, &head);
 
 	dev_vdbg(dchan2dev(dchan), "terminated: %s\n", axi_chan_name(chan));
@@ -1532,6 +1596,7 @@ static int dw_probe(struct platform_device *pdev)
 		return ret;
 
 	INIT_LIST_HEAD(&dw->dma.channels);
+	dma_cap_set(DMA_OOB,dw->dma.cap_mask);
 	for (i = 0; i < hdata->nr_channels; i++) {
 		struct axi_dma_chan *chan = &dw->chan[i];
 
@@ -1572,6 +1637,7 @@ static int dw_probe(struct platform_device *pdev)
 	dw->dma.device_config = dw_axi_dma_chan_slave_config;
 	dw->dma.device_prep_slave_sg = dw_axi_dma_chan_prep_slave_sg;
 	dw->dma.device_prep_dma_cyclic = dw_axi_dma_chan_prep_cyclic;
+	dw->dma.device_pulse_oob       = dw_axi_dma_pulse_oob;
 
 	/*
 	 * Synopsis DesignWare AxiDMA datasheet mentioned Maximum

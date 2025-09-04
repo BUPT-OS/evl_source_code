@@ -190,6 +190,13 @@ config DW_AXI_DMAC
 	  NOTE: This driver wasn't tested on 64 bit platform because
 	  of lack 64 bit platform with Synopsys DW AXI DMAC.
 
+config DW_AXI_DMAC_OOB
+    bool "Out-of-band support for DW AXI DMA"
+    depends on DW_AXI_DMAC && DOVETAIL
+    select DMA_VIRTUAL_CHANNELS_OOB
+    help
+      Enable out-of-band requests to DW AXI DMA.
+
 config EP93XX_DMA
 	bool "Cirrus Logic EP93xx DMA support"
 	depends on ARCH_EP93XX || COMPILE_TEST

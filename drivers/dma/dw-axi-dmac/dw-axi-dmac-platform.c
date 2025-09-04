@@ -370,7 +370,6 @@ dma_chan_tx_status(struct dma_chan *dchan, dma_cookie_t cookie,
 	if (status == DMA_COMPLETE || !txstate)
 		return status;
 
-	// spin_lock_irqsave(&chan->vc.lock, flags);
 	vchan_lock_irqsave(&chan->vc,flags);
 	vdesc = vchan_find_desc(&chan->vc, cookie);
 	if (vdesc) {
@@ -381,7 +380,6 @@ dma_chan_tx_status(struct dma_chan *dchan, dma_cookie_t cookie,
 		bytes = length - completed_length;
 	}
 
-	// spin_unlock_irqrestore(&chan->vc.lock, flags);
 	vchan_unlock_irqrestore(&chan->vc,flags);
 	dma_set_residue(txstate, bytes);
 
@@ -511,11 +509,9 @@ static void dma_chan_issue_pending(struct dma_chan *dchan)
 	struct axi_dma_chan *chan = dchan_to_axi_dma_chan(dchan);
 	unsigned long flags;
 
-	// spin_lock_irqsave(&chan->vc.lock, flags);
 	vchan_lock_irqsave(&chan->vc,flags);
 	if (vchan_issue_pending(&chan->vc))
 		axi_chan_start_first_queued(chan);
-	// spin_unlock_irqrestore(&chan->vc.lock, flags);
 	vchan_unlock_irqrestore(&chan->vc,flags);
 }
 
@@ -1124,7 +1120,6 @@ static noinline void axi_chan_handle_err(struct axi_dma_chan *chan, u32 status)
 	struct virt_dma_desc *vd;
 	unsigned long flags;
 
-	// spin_lock_irqsave(&chan->vc.lock, flags);
 	vchan_lock_irqsave(&chan->vc, flags);
 	axi_chan_disable(chan);
 
@@ -1150,7 +1145,6 @@ static noinline void axi_chan_handle_err(struct axi_dma_chan *chan, u32 status)
 	axi_chan_start_first_queued(chan);
 
 out:
-	// spin_unlock_irqrestore(&chan->vc.lock, flags);
 	vchan_unlock_irqrestore(&chan->vc, flags);
 }
 
@@ -1164,7 +1158,6 @@ static void axi_chan_block_xfer_complete(struct axi_dma_chan *chan)
 	u64 llp;
 	int i;
 
-	// spin_lock_irqsave(&chan->vc.lock, flags);
 	vchan_lock_irqsave(&chan->vc, flags);
 	if (unlikely(axi_chan_is_hw_enable(chan))) {
 		dev_err(chan2dev(chan), "BUG: %s caught DWAXIDMAC_IRQ_DMA_TRF, but channel not idle!\n",
@@ -1206,7 +1199,6 @@ static void axi_chan_block_xfer_complete(struct axi_dma_chan *chan)
 	}
 
 out:
-	// spin_unlock_irqrestore(&chan->vc.lock, flags);
 	vchan_unlock_irqrestore(&chan->vc, flags);
 }
 
@@ -1264,12 +1256,10 @@ static int dma_chan_terminate_all(struct dma_chan *dchan)
 	if (chan->direction == DMA_MEM_TO_DEV)
 		dw_axi_dma_set_byte_halfword(chan, false);
 
-	// spin_lock_irqsave(&chan->vc.lock, flags);
 	vchan_lock_irqsave(&chan->vc, flags);
 	vchan_get_all_descriptors(&chan->vc, &head);
 
 	chan->cyclic = false;
-	// spin_unlock_irqrestore(&chan->vc.lock, flags);
 	vchan_unlock_irqrestore(&chan->vc, flags);
 	vchan_dma_desc_free_list(&chan->vc, &head);
 
@@ -1285,7 +1275,7 @@ static int dma_chan_pause(struct dma_chan *dchan)
 	unsigned int timeout = 20; /* timeout iterations */
 	u64 val;
 
-	spin_lock_irqsave(&chan->vc.lock, flags);
+	vchan_lock_irqsave(&chan->vc, flags);
 
 	if (chan->chip->dw->hdata->nr_channels >= DMAC_CHAN_16) {
 		val = axi_dma_ioread64(chan->chip, DMAC_CHSUSPREG);
@@ -1324,8 +1314,7 @@ static int dma_chan_pause(struct dma_chan *dchan)
 
 	chan->is_paused = true;
 
-	spin_unlock_irqrestore(&chan->vc.lock, flags);
-
+	vchan_unlock_irqrestore(&chan->vc, flags);
 	return timeout ? 0 : -EAGAIN;
 }
 
@@ -1368,12 +1357,12 @@ static int dma_chan_resume(struct dma_chan *dchan)
 	struct axi_dma_chan *chan = dchan_to_axi_dma_chan(dchan);
 	unsigned long flags;
 
-	spin_lock_irqsave(&chan->vc.lock, flags);
+	vchan_lock_irqsave(&chan->vc,flags);
 
 	if (chan->is_paused)
 		axi_chan_resume(chan);
 
-	spin_unlock_irqrestore(&chan->vc.lock, flags);
+	vchan_unlock_irqrestore(&chan->vc,flags);
 
 	return 0;
 }

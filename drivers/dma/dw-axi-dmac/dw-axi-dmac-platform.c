@@ -1148,7 +1148,7 @@ out:
 	vchan_unlock_irqrestore(&chan->vc, flags);
 }
 
-static void axi_chan_block_xfer_complete(struct axi_dma_chan *chan)
+static bool axi_chan_block_xfer_complete(struct axi_dma_chan *chan)
 {
 	int count = atomic_read(&chan->descs_allocated);
 	struct axi_dma_hw_desc *hw_desc;
@@ -1157,8 +1157,35 @@ static void axi_chan_block_xfer_complete(struct axi_dma_chan *chan)
 	unsigned long flags;
 	u64 llp;
 	int i;
+	struct dmaengine_desc_callback cb;
+	bool ret = true;
 
 	vchan_lock_irqsave(&chan->vc, flags);
+
+	if(running_oob()) {//oob
+		if (unlikely(axi_chan_is_hw_enable(chan))) {
+				ret = false;//caught bug,no operation in oob,forward to inband
+		}
+		vd = vchan_next_desc(&chan->vc);
+		if (!vd) {
+				ret = false;
+				goto out;//caught bug,no operation in oob,forward to inband
+		}
+		if(!vchan_oob_handled(vd)) {
+				ret = false;
+				goto out;
+		}
+		dmaengine_desc_get_callback(&vd->tx,&cb);//get callback
+		if(dmaengine_desc_callback_valid(&cb)) {
+			vchan_unlock_irqrestore(&chan->vc, flags);
+			dmaengine_desc_callback_invoke(&cb,NULL);
+			vchan_lock_irqsave(&chan->vc, flags);
+		}
+		ret = true;
+		goto out;
+	}
+
+	//ib:we don't care about ret in ib context,for we won't forward the irq again
 	if (unlikely(axi_chan_is_hw_enable(chan))) {
 		dev_err(chan2dev(chan), "BUG: %s caught DWAXIDMAC_IRQ_DMA_TRF, but channel not idle!\n",
 			axi_chan_name(chan));
@@ -1200,6 +1227,7 @@ static void axi_chan_block_xfer_complete(struct axi_dma_chan *chan)
 
 out:
 	vchan_unlock_irqrestore(&chan->vc, flags);
+	return ret;
 }
 
 static irqreturn_t dw_axi_dma_interrupt(int irq, void *dev_id)
@@ -1209,6 +1237,7 @@ static irqreturn_t dw_axi_dma_interrupt(int irq, void *dev_id)
 	struct axi_dma_chan *chan;
 
 	u32 status, i;
+	irqreturn_t ret = IRQ_HANDLED;
 
 	/* Disable DMAC interrupts. We'll enable them after processing channels */
 	axi_dma_irq_disable(chip);
@@ -1219,19 +1248,26 @@ static irqreturn_t dw_axi_dma_interrupt(int irq, void *dev_id)
 		status = axi_chan_irq_read(chan);
 		axi_chan_irq_clear(chan, status);
 
-		dev_vdbg(chip->dev, "%s %u IRQ status: 0x%08x\n",
-			axi_chan_name(chan), i, status);
-
-		if (status & DWAXIDMAC_IRQ_ALL_ERR)
-			axi_chan_handle_err(chan, status);
-		else if (status & DWAXIDMAC_IRQ_DMA_TRF)
-			axi_chan_block_xfer_complete(chan);
+		if(dw_axi_dma_oob_capable() && running_oob()) {
+			if(status & DWAXIDMAC_IRQ_ALL_ERR) {
+				ret = IRQ_FORWARD;
+			} else if(status & DWAXIDMAC_IRQ_DMA_TRF) {
+				if(!axi_chan_block_xfer_complete(chan))
+					ret = IRQ_FORWARD;
+			}
+		} else {
+			dev_vdbg(chip->dev, "%s %u IRQ status: 0x%08x\n",
+				axi_chan_name(chan), i, status);
+			if (status & DWAXIDMAC_IRQ_ALL_ERR)
+				axi_chan_handle_err(chan, status);
+			else if (status & DWAXIDMAC_IRQ_DMA_TRF)
+				axi_chan_block_xfer_complete(chan);
+		}
 	}
 
 	/* Re-enable interrupts */
 	axi_dma_irq_enable(chip);
-
-	return IRQ_HANDLED;
+	return ret;
 }
 
 static int dma_chan_terminate_all(struct dma_chan *dchan)
@@ -1666,7 +1702,9 @@ static int dw_probe(struct platform_device *pdev)
 
 	dev_info(chip->dev, "DesignWare AXI DMA Controller, %d channels\n",
 		 dw->hdata->nr_channels);
-
+	if(dw_axi_dma_oob_capable()) {
+    	dev_info(chip->dev,"this driver is oob capable");
+    }
 	return 0;
 
 err_pm_disable:

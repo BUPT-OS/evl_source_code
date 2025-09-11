@@ -1246,7 +1246,7 @@ static int do_interrupt_dma_transfer(struct pl022 *pl022)
 	 * this will be enabled once TX is complete
 	 */
 	u32 irqflags = (u32)(ENABLE_ALL_INTERRUPTS & ~SSP_IMSC_MASK_RXIM);
-
+	dev_info(&pl022->adev->dev,"do_interrupt_dma_transfere \n");
 	ret = set_up_next_transfer(pl022, pl022->cur_transfer);
 	if (ret)
 		return ret;
@@ -1685,7 +1685,9 @@ static int pl022_setup(struct spi_device *spi)
 	pl022->tx_lev_trig = chip_info->tx_lev_trig;
 
 	/* Now set controller state based on controller data */
-	chip->xfer_type = chip_info->com_mode;
+	// chip->xfer_type = chip_info->com_mode;
+	chip->xfer_type = DMA_TRANSFER;
+	dev_info(&spi->dev,"com_mode set to DMA_TRANSFER\n");
 
 	/* Check bits per word with vendor specific range */
 	if ((bits <= 3) || (bits > pl022->vendor->max_bpw)) {
@@ -1950,8 +1952,10 @@ static int pl022_probe(struct amba_device *adev, const struct amba_id *id)
 	}
 
 	/* If that failed, use channels from platform_info */
-	if (status == 0)
+	if (status == 0) {
 		platform_info->enable_dma = 1;
+		dev_info(dev, "dma auto probe success\n");
+	}		
 	else if (platform_info->enable_dma) {
 		status = pl022_dma_probe(pl022);
 		if (status != 0)

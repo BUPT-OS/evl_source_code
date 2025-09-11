@@ -940,12 +940,14 @@ static void pl08x_phy_free(struct pl08x_dma_chan *plchan)
 		 * Eww.  We know this isn't going to deadlock
 		 * but lockdep probably doesn't.
 		 */
-		spin_lock(&next->vc.lock);
+		// spin_lock(&next->vc.lock);
+		vchan_lock(&next->vc);
 		/* Re-check the state now that we have the lock */
 		success = next->state == PL08X_CHAN_WAITING;
 		if (success)
 			pl08x_phy_reassign_start(plchan->phychan, next);
-		spin_unlock(&next->vc.lock);
+		// spin_unlock(&next->vc.lock);
+		vchan_unlock(&next->vc);
 
 		/* If the state changed, try to find another channel */
 		if (!success)
@@ -1563,7 +1565,8 @@ static enum dma_status pl08x_dma_tx_status(struct dma_chan *chan,
 		return ret;
 	}
 
-	spin_lock_irqsave(&plchan->vc.lock, flags);
+	// spin_lock_irqsave(&plchan->vc.lock, flags);
+	vchan_lock_irqsave(&plchan->vc,flags);
 	ret = dma_cookie_status(chan, cookie, txstate);
 	if (ret != DMA_COMPLETE) {
 		vd = vchan_find_desc(&plchan->vc, cookie);
@@ -1578,8 +1581,8 @@ static enum dma_status pl08x_dma_tx_status(struct dma_chan *chan,
 			bytes = pl08x_getbytes_chan(plchan);
 		}
 	}
-	spin_unlock_irqrestore(&plchan->vc.lock, flags);
-
+	// spin_unlock_irqrestore(&plchan->vc.lock, flags);
+	vchan_unlock_irqrestore(&plchan->vc,flags);
 	/*
 	 * This cookie not complete yet
 	 * Get number of bytes left in the active transactions and queue
@@ -1733,12 +1736,14 @@ static void pl08x_issue_pending(struct dma_chan *chan)
 	struct pl08x_dma_chan *plchan = to_pl08x_chan(chan);
 	unsigned long flags;
 
-	spin_lock_irqsave(&plchan->vc.lock, flags);
+	// spin_lock_irqsave(&plchan->vc.lock, flags);
+	vchan_lock_irqsave(&plchan->vc,flags);
 	if (vchan_issue_pending(&plchan->vc)) {
 		if (!plchan->phychan && plchan->state != PL08X_CHAN_WAITING)
 			pl08x_phy_alloc_and_start(plchan);
 	}
-	spin_unlock_irqrestore(&plchan->vc.lock, flags);
+	// spin_unlock_irqrestore(&plchan->vc.lock, flags);
+	vchan_unlock_irqrestore(&plchan->vc,flags);
 }
 
 static struct pl08x_txd *pl08x_get_txd(struct pl08x_dma_chan *plchan)
@@ -2155,9 +2160,11 @@ static int pl08x_terminate_all(struct dma_chan *chan)
 	struct pl08x_driver_data *pl08x = plchan->host;
 	unsigned long flags;
 
-	spin_lock_irqsave(&plchan->vc.lock, flags);
+	// spin_lock_irqsave(&plchan->vc.lock, flags);
+	vchan_lock_irqsave(&plchan->vc,flags);
 	if (!plchan->phychan && !plchan->at) {
-		spin_unlock_irqrestore(&plchan->vc.lock, flags);
+		// spin_unlock_irqrestore(&plchan->vc.lock, flags);
+		vchan_unlock_irqrestore(&plchan->vc,flags);
 		return 0;
 	}
 
@@ -2178,8 +2185,8 @@ static int pl08x_terminate_all(struct dma_chan *chan)
 	/* Dequeue jobs not yet fired as well */
 	pl08x_free_txd_list(pl08x, plchan);
 
-	spin_unlock_irqrestore(&plchan->vc.lock, flags);
-
+	// spin_unlock_irqrestore(&plchan->vc.lock, flags);
+	vchan_unlock_irqrestore(&plchan->vc,flags);
 	return 0;
 }
 
@@ -2199,16 +2206,19 @@ static int pl08x_pause(struct dma_chan *chan)
 	 * Anything succeeds on channels with no physical allocation and
 	 * no queued transfers.
 	 */
-	spin_lock_irqsave(&plchan->vc.lock, flags);
+	// spin_lock_irqsave(&plchan->vc.lock, flags);
+	vchan_lock_irqsave(&plchan->vc,flags);
 	if (!plchan->phychan && !plchan->at) {
-		spin_unlock_irqrestore(&plchan->vc.lock, flags);
+		// spin_unlock_irqrestore(&plchan->vc.lock, flags);
+		vchan_unlock_irqrestore(&plchan->vc,flags);
 		return 0;
 	}
 
 	pl08x_pause_phy_chan(plchan->phychan);
 	plchan->state = PL08X_CHAN_PAUSED;
 
-	spin_unlock_irqrestore(&plchan->vc.lock, flags);
+	// spin_unlock_irqrestore(&plchan->vc.lock, flags);
+	vchan_unlock_irqrestore(&plchan->vc,flags);
 
 	return 0;
 }
@@ -2222,17 +2232,19 @@ static int pl08x_resume(struct dma_chan *chan)
 	 * Anything succeeds on channels with no physical allocation and
 	 * no queued transfers.
 	 */
-	spin_lock_irqsave(&plchan->vc.lock, flags);
+	// spin_lock_irqsave(&plchan->vc.lock, flags);
+	vchan_lock_irqsave(&plchan->vc,flags);
 	if (!plchan->phychan && !plchan->at) {
-		spin_unlock_irqrestore(&plchan->vc.lock, flags);
+		// spin_unlock_irqrestore(&plchan->vc.lock, flags);
+		vchan_unlock_irqrestore(&plchan->vc,flags);
 		return 0;
 	}
 
 	pl08x_resume_phy_chan(plchan->phychan);
 	plchan->state = PL08X_CHAN_RUNNING;
 
-	spin_unlock_irqrestore(&plchan->vc.lock, flags);
-
+	// spin_unlock_irqrestore(&plchan->vc.lock, flags);
+	vchan_unlock_irqrestore(&plchan->vc,flags);
 	return 0;
 }
 
@@ -2314,7 +2326,8 @@ static irqreturn_t pl08x_irq(int irq, void *dev)
 				continue;
 			}
 
-			spin_lock(&plchan->vc.lock);
+			// spin_lock(&plchan->vc.lock);
+			vchan_lock(&plchan->vc);
 			tx = plchan->at;
 			if (tx && tx->cyclic) {
 				vchan_cyclic_callback(&tx->vd);
@@ -2337,7 +2350,8 @@ static irqreturn_t pl08x_irq(int irq, void *dev)
 				else
 					pl08x_phy_free(plchan);
 			}
-			spin_unlock(&plchan->vc.lock);
+			// spin_unlock(&plchan->vc.lock);
+			vchan_unlock(&plchan->vc);
 
 			mask |= BIT(i);
 		}
@@ -2952,7 +2966,8 @@ static int pl08x_probe(struct amba_device *adev, const struct amba_id *id)
 	dev_info(&pl08x->adev->dev, "DMA: PL%03x%s rev%u at 0x%08llx irq %d\n",
 		 amba_part(adev), pl08x->vd->pl080s ? "s" : "", amba_rev(adev),
 		 (unsigned long long)adev->res.start, adev->irq[0]);
-
+	
+	dev_info(&pl08x->adev->dev, "probe modify success\n");
 	return 0;
 
 out_no_slave_reg:

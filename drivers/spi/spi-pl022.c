@@ -791,6 +791,37 @@ static void setup_dma_scatter(struct pl022 *pl022,
 	BUG_ON(bytesleft);
 }
 
+
+static void print_spi_regs(void __iomem *spi_base_addr_virt)
+{
+    u32 read_cr0;
+	u16 read_cr1, read_dmacr, read_sr, read_cpsr ,read_imsc;
+
+    read_cr0   = readw(SSP_CR0(spi_base_addr_virt));
+	read_cr1   = readw(SSP_CR1(spi_base_addr_virt));
+	read_dmacr = readw(SSP_DMACR(spi_base_addr_virt));
+	read_sr    = readw(SSP_SR(spi_base_addr_virt));
+	read_cpsr  = readw(SSP_CPSR(spi_base_addr_virt));
+	read_imsc  = readw(SSP_IMSC(spi_base_addr_virt));
+
+    pr_info("SPI CR0=0x%x\n",read_cr0);
+
+    pr_info("SPI CR1=0x%x, SPI enable=%d\n",
+        read_cr1,
+        !!(read_cr1 & SSP_CR1_MASK_SSE));
+
+    pr_info("SPI SR=0x%x\n",read_sr);
+
+	pr_info("SPI CPSR=0x%x\n",read_cpsr);
+
+	pr_info("SPI IMSC=0x%x\n",read_imsc);
+
+    pr_info("SPI DMACR=0x%x, SPI DMA rx dmaenable=%d, SPI DMA tx dmaenable=%d\n",
+        read_dmacr,
+        !!(read_dmacr & SSP_DMACR_MASK_RXDMAE),
+        !!(read_dmacr & SSP_DMACR_MASK_TXDMAE));
+    return;
+}
 /**
  * configure_dma - configures the channels for the next transfer
  * @pl022: SSP driver's private data structure
@@ -819,6 +850,7 @@ static int configure_dma(struct pl022 *pl022)
 	if (!rxchan || !txchan)
 		return -ENODEV;
 
+	pr_info("c_dma:1\n");
 	/*
 	 * If supplied, the DMA burstsize should equal the FIFO trigger level.
 	 * Notice that the DMA engine uses one-to-one mapping. Since we can
@@ -908,7 +940,7 @@ static int configure_dma(struct pl022 *pl022)
 
 	dmaengine_slave_config(rxchan, &rx_conf);
 	dmaengine_slave_config(txchan, &tx_conf);
-
+	pr_info("c_dma:2\n");
 	/* Create sglists for the transfers */
 	pages = DIV_ROUND_UP(pl022->cur_transfer->len, PAGE_SIZE);
 	dev_dbg(&pl022->adev->dev, "using %d pages for transfer\n", pages);
@@ -920,7 +952,7 @@ static int configure_dma(struct pl022 *pl022)
 	ret = sg_alloc_table(&pl022->sgt_tx, pages, GFP_ATOMIC);
 	if (ret)
 		goto err_alloc_tx_sg;
-
+	pr_info("c_dma:3\n");
 	/* Fill in the scatterlists for the RX+TX buffers */
 	setup_dma_scatter(pl022, pl022->rx,
 			  pl022->cur_transfer->len, &pl022->sgt_rx);
@@ -932,7 +964,7 @@ static int configure_dma(struct pl022 *pl022)
 			   pl022->sgt_rx.nents, DMA_FROM_DEVICE);
 	if (!rx_sglen)
 		goto err_rx_sgmap;
-
+	pr_info("c_dma:4\n");
 	tx_sglen = dma_map_sg(txchan->device->dev, pl022->sgt_tx.sgl,
 			   pl022->sgt_tx.nents, DMA_TO_DEVICE);
 	if (!tx_sglen)
@@ -946,7 +978,7 @@ static int configure_dma(struct pl022 *pl022)
 				      DMA_PREP_INTERRUPT | DMA_CTRL_ACK);
 	if (!rxdesc)
 		goto err_rxdesc;
-
+	pr_info("c_dma:5\n");
 	txdesc = dmaengine_prep_slave_sg(txchan,
 				      pl022->sgt_tx.sgl,
 				      tx_sglen,
@@ -954,7 +986,7 @@ static int configure_dma(struct pl022 *pl022)
 				      DMA_PREP_INTERRUPT | DMA_CTRL_ACK);
 	if (!txdesc)
 		goto err_txdesc;
-
+	pr_info("c_dma:6\n");
 	/* Put the callback on the RX transfer only, that should finish last */
 	rxdesc->callback = dma_callback;
 	rxdesc->callback_param = pl022;
@@ -965,6 +997,8 @@ static int configure_dma(struct pl022 *pl022)
 	dma_async_issue_pending(rxchan);
 	dma_async_issue_pending(txchan);
 	pl022->dma_running = true;
+	pr_info("after issuepending\n");
+	print_spi_regs(pl022->virtbase);
 
 	return 0;
 
@@ -984,6 +1018,72 @@ err_alloc_tx_sg:
 err_alloc_rx_sg:
 	return -ENOMEM;
 }
+//filter dmac by device name,target for dw-axi-dmac
+static bool my_dma_filter(struct dma_chan *chan, void *param)
+{
+    if (!chan || !chan->device)
+        return false;
+
+    struct device *dev = chan->device->dev;
+    const char *target_name = param;
+
+    if (!dev || !dev->of_node)
+        return false;
+
+    const char *node_name = of_node_full_name(dev->of_node);
+    if (!node_name) {
+        return false;
+    }        
+
+    return strcmp(node_name, target_name) == 0;
+}
+static int pl022_dma_probe_debug(struct pl022 *pl022)
+{
+	dma_cap_mask_t mask;
+
+	/* Try to acquire a generic DMA engine slave channel */
+	dma_cap_zero(mask);
+	dma_cap_set(DMA_SLAVE, mask);
+	/*
+	 * We need both RX and TX channels to do DMA, else do none
+	 * of them.
+	 */
+	pl022->dma_rx_channel = dma_request_channel(mask,
+					    my_dma_filter,
+					    "dma-controller@16008000");
+	if (!pl022->dma_rx_channel) {
+		dev_info(&pl022->adev->dev, "no RX DMA channel!\n");
+		goto err_no_rxchan;
+	}
+
+	pl022->dma_tx_channel = dma_request_channel(mask,
+					    my_dma_filter,
+					    "dma-controller@16008000");
+	if (!pl022->dma_tx_channel) {
+		dev_info(&pl022->adev->dev, "no TX DMA channel!\n");
+		goto err_no_txchan;
+	}
+
+	pl022->dummypage = kmalloc(PAGE_SIZE, GFP_KERNEL);
+	if (!pl022->dummypage)
+		goto err_no_dummypage;
+
+	dev_info(&pl022->adev->dev, "setup for DMA on RX %s, TX %s\n",
+		 dma_chan_name(pl022->dma_rx_channel),
+		 dma_chan_name(pl022->dma_tx_channel));
+
+	return 0;
+
+err_no_dummypage:
+	dma_release_channel(pl022->dma_tx_channel);
+err_no_txchan:
+	dma_release_channel(pl022->dma_rx_channel);
+	pl022->dma_rx_channel = NULL;
+err_no_rxchan:
+	dev_err(&pl022->adev->dev,
+			"Failed to work in dma mode, work without dma!\n");
+	return -ENODEV;
+}
 
 static int pl022_dma_probe(struct pl022 *pl022)
 {
@@ -1000,7 +1100,7 @@ static int pl022_dma_probe(struct pl022 *pl022)
 					    pl022->host_info->dma_filter,
 					    pl022->host_info->dma_rx_param);
 	if (!pl022->dma_rx_channel) {
-		dev_dbg(&pl022->adev->dev, "no RX DMA channel!\n");
+		dev_info(&pl022->adev->dev, "no RX DMA channel!\n");
 		goto err_no_rxchan;
 	}
 
@@ -1008,7 +1108,7 @@ static int pl022_dma_probe(struct pl022 *pl022)
 					    pl022->host_info->dma_filter,
 					    pl022->host_info->dma_tx_param);
 	if (!pl022->dma_tx_channel) {
-		dev_dbg(&pl022->adev->dev, "no TX DMA channel!\n");
+		dev_info(&pl022->adev->dev, "no TX DMA channel!\n");
 		goto err_no_txchan;
 	}
 
@@ -1250,10 +1350,13 @@ static int do_interrupt_dma_transfer(struct pl022 *pl022)
 	ret = set_up_next_transfer(pl022, pl022->cur_transfer);
 	if (ret)
 		return ret;
-
+	pr_info("before configure\n");
+	print_spi_regs(pl022->virtbase);
+	pl022->cur_chip->enable_dma = true;
 	/* If we're using DMA, set up DMA here */
 	if (pl022->cur_chip->enable_dma) {
 		/* Configure DMA transfer */
+		pr_info("c_dma:0\n");
 		if (configure_dma(pl022)) {
 			dev_dbg(&pl022->adev->dev,
 				"configuration of DMA failed, fall back to interrupt mode\n");
@@ -1567,7 +1670,8 @@ static int calculate_effective_freq(struct pl022 *pl022, int freq, struct
  * supplies it.
  */
 static const struct pl022_config_chip pl022_default_chip_info = {
-	.com_mode = INTERRUPT_TRANSFER,
+	// .com_mode = INTERRUPT_TRANSFER,
+	.com_mode = DMA_TRANSFER,
 	.iface = SSP_INTERFACE_MOTOROLA_SPI,
 	.hierarchy = SSP_MASTER,
 	.slave_tx_disable = DO_NOT_DRIVE_TX,
@@ -1618,9 +1722,9 @@ static int pl022_setup(struct spi_device *spi)
 
 	/* Get controller data if one is supplied */
 	chip_info = spi->controller_data;
-
 	if (chip_info == NULL) {
 		if (np) {
+			dev_info(&spi->dev,"using pl022_default_chip_info\n");
 			chip_info_dt = pl022_default_chip_info;
 
 			chip_info_dt.hierarchy = SSP_MASTER;
@@ -1643,11 +1747,11 @@ static int pl022_setup(struct spi_device *spi)
 		} else {
 			chip_info = &pl022_default_chip_info;
 			/* spi_board_info.controller_data not is supplied */
-			dev_dbg(&spi->dev,
+			dev_info(&spi->dev,
 				"using default controller_data settings\n");
 		}
 	} else
-		dev_dbg(&spi->dev,
+		dev_info(&spi->dev,
 			"using user supplied controller_data settings\n");
 
 	/*
@@ -1685,8 +1789,7 @@ static int pl022_setup(struct spi_device *spi)
 	pl022->tx_lev_trig = chip_info->tx_lev_trig;
 
 	/* Now set controller state based on controller data */
-	// chip->xfer_type = chip_info->com_mode;
-	chip->xfer_type = DMA_TRANSFER;
+	chip->xfer_type = chip_info->com_mode;
 	dev_info(&spi->dev,"com_mode set to DMA_TRANSFER\n");
 
 	/* Check bits per word with vendor specific range */
@@ -1721,14 +1824,14 @@ static int pl022_setup(struct spi_device *spi)
 	if ((chip_info->com_mode == DMA_TRANSFER)
 	    && ((pl022->host_info)->enable_dma)) {
 		chip->enable_dma = true;
-		dev_dbg(&spi->dev, "DMA mode set in controller state\n");
+		dev_info(&spi->dev, "DMA mode set in controller state\n");
 		SSP_WRITE_BITS(chip->dmacr, SSP_DMA_ENABLED,
 			       SSP_DMACR_MASK_RXDMAE, 0);
 		SSP_WRITE_BITS(chip->dmacr, SSP_DMA_ENABLED,
 			       SSP_DMACR_MASK_TXDMAE, 1);
 	} else {
 		chip->enable_dma = false;
-		dev_dbg(&spi->dev, "DMA mode NOT set in controller state\n");
+		dev_info(&spi->dev, "DMA mode NOT set in controller state\n");
 		SSP_WRITE_BITS(chip->dmacr, SSP_DMA_DISABLED,
 			       SSP_DMACR_MASK_RXDMAE, 0);
 		SSP_WRITE_BITS(chip->dmacr, SSP_DMA_DISABLED,
@@ -1862,6 +1965,10 @@ static int pl022_probe(struct amba_device *adev, const struct amba_id *id)
 	struct pl022 *pl022 = NULL;	/*Data for this driver */
 	int status = 0;
 
+	if (id && id->data)
+        pr_info("Matched AMBA ID: 0x%08x, vendor_data pointer: %p\n",
+                id->id, id->data);
+
 	dev_info(&adev->dev,
 		 "ARM PL022 driver, device ID: 0x%08x\n", adev->periphid);
 	if (!platform_info && IS_ENABLED(CONFIG_OF))
@@ -1882,6 +1989,7 @@ static int pl022_probe(struct amba_device *adev, const struct amba_id *id)
 	pl022 = spi_controller_get_devdata(host);
 	pl022->host = host;
 	pl022->host_info = platform_info;
+	pl022->host_info->enable_dma = true;
 	pl022->adev = adev;
 	pl022->vendor = id->data;
 
@@ -1957,9 +2065,11 @@ static int pl022_probe(struct amba_device *adev, const struct amba_id *id)
 		dev_info(dev, "dma auto probe success\n");
 	}		
 	else if (platform_info->enable_dma) {
-		status = pl022_dma_probe(pl022);
+		status = pl022_dma_probe_debug(pl022);
 		if (status != 0)
 			platform_info->enable_dma = 0;
+		else
+			dev_info(dev, "dma probe success\n");
 	}
 
 	/* Register with the SPI framework */

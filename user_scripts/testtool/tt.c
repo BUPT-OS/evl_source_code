@@ -16,16 +16,19 @@
 enum Command {
     CMD_UNKNOWN,
     CMD_DW_MEMCPY_IB_TEST,//test inband memcpy by dw-axi-dmac
-    CMD_SPILOOP_TEST  //test dma by PL08 using spi loopback
+    CMD_SPILOOP_TEST,  //test dma by PL08 using spi loopback
+    CMD_SPI_USERDMA_IB
 };
 
 enum Command parse_command(const char *arg) {
     if (strcmp(arg, "dw_mem_ib") == 0) return CMD_DW_MEMCPY_IB_TEST;
-    if (strcmp(arg, "spi") == 0) return CMD_SPILOOP_TEST;
+    if (strcmp(arg, "spi_driver_loop") == 0) return CMD_SPILOOP_TEST;
+    if (strcmp(arg, "spi_userdma_ib") == 0) return CMD_SPI_USERDMA_IB;
     return CMD_UNKNOWN;
 }
 
 #define USER_DMA_IOCTL_IB_TEST       _IOR('M', 1, int)  
+#define USER_DMA_IOCTL_SPI_LOOP_IB   _IOR('M', 2, int)//test inband spi dma loopback
 
 int do_dw_memcpy_ib_test(void)
 {
@@ -53,7 +56,7 @@ int do_dw_memcpy_ib_test(void)
     close(fd);
     return 0;
 }
-
+    
 int do_spi_loop_test(void)
 {
     bool test_success = true;
@@ -137,6 +140,33 @@ int do_spi_loop_test(void)
     close(fd);
     return 0;
 }
+
+int do_spi_userdma_ib_test(void)
+{
+    const char *dev = "/dev/user_dma";
+    int fd;
+    int value;
+
+    fd = open(dev, O_RDWR);
+    if (fd < 0) {
+        perror("open");
+        return EXIT_FAILURE;
+    }
+    int ret = ioctl(fd, USER_DMA_IOCTL_SPI_LOOP_IB,&value);
+    if (ret < 0) {
+        perror("ioctl");
+        close(fd);
+        return EXIT_FAILURE;
+    }
+    printf("inband spi loopback by user_dma executed finish\n");
+    if(value==0) {
+        printf("inband spi loopback success!\n");
+    } else {
+        printf("inband spi loopback error!\n");
+    }
+    close(fd);
+    return 0;
+}
 int main(int argc, char *argv[])
 {
     int ret = 0;
@@ -148,6 +178,10 @@ int main(int argc, char *argv[])
         }
         case CMD_SPILOOP_TEST: {
             ret = do_spi_loop_test();
+            break;
+        }
+        case CMD_SPI_USERDMA_IB: {
+            ret = do_spi_userdma_ib_test();
             break;
         }
         default:

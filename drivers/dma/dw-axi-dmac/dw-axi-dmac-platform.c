@@ -29,6 +29,7 @@
 #include <linux/reset.h>
 #include <linux/slab.h>
 #include <linux/types.h>
+#include <evl/irq.h>
 
 #include "dw-axi-dmac.h"
 #include "../dmaengine.h"
@@ -1242,20 +1243,40 @@ static irqreturn_t dw_axi_dma_interrupt(int irq, void *dev_id)
 	/* Disable DMAC interrupts. We'll enable them after processing channels */
 	axi_dma_irq_disable(chip);
 
+	if(dw_axi_dma_oob_capable()){
+		pr_info("AXI_DAC:oob capable\n");
+	} else {
+		pr_info("AXI_DAC:oob disable\n");
+	}
+	if(running_oob()) {
+		pr_info("AXI_DAC:oob\n");
+	} else {
+		pr_info("AXI_DAC:ib\n");
+	}
+
 	/* Poll, clear and process every channel interrupt status */
 	for (i = 0; i < dw->hdata->nr_channels; i++) {
 		chan = &dw->chan[i];
 		status = axi_chan_irq_read(chan);
-		axi_chan_irq_clear(chan, status);
 
 		if(dw_axi_dma_oob_capable() && running_oob()) {
+			pr_info("AXI_DAC:1\n");
 			if(status & DWAXIDMAC_IRQ_ALL_ERR) {
+				pr_info("AXI_DAC:2\n");
 				ret = IRQ_FORWARD;
 			} else if(status & DWAXIDMAC_IRQ_DMA_TRF) {
-				if(!axi_chan_block_xfer_complete(chan))
+				pr_info("AXI_DAC:3\n");
+				if(!axi_chan_block_xfer_complete(chan)) {
 					ret = IRQ_FORWARD;
+					pr_info("AXI_DAC:4\n");
+				} else {//only clear irq when process success
+					axi_chan_irq_clear(chan, status);		
+					pr_info("AXI_DAC:5\n");
+				}
 			}
 		} else {
+			pr_info("AXI_DAC:11\n");
+			axi_chan_irq_clear(chan, status);
 			dev_vdbg(chip->dev, "%s %u IRQ status: 0x%08x\n",
 				axi_chan_name(chan), i, status);
 			if (status & DWAXIDMAC_IRQ_ALL_ERR)
@@ -1541,8 +1562,9 @@ static int axi_req_irqs(struct platform_device *pdev, struct axi_dma_chip *chip)
 		chip->irq[i] = platform_get_irq(pdev, i);
 		if (chip->irq[i] < 0)
 			return chip->irq[i];
-		ret = devm_request_irq(chip->dev, chip->irq[i], dw_axi_dma_interrupt,
-				IRQF_SHARED, KBUILD_MODNAME, chip);
+		// ret = devm_request_irq(chip->dev, chip->irq[i], dw_axi_dma_interrupt,
+		// 		IRQF_SHARED, KBUILD_MODNAME, chip);
+		ret = request_irq(chip->irq[i], dw_axi_dma_interrupt,IRQF_SHARED | IRQF_OOB, KBUILD_MODNAME, chip);
 		if (ret < 0)
 			return ret;
 	}

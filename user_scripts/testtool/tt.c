@@ -15,20 +15,28 @@
 
 enum Command {
     CMD_UNKNOWN,
-    CMD_DW_MEMCPY_IB_TEST,//test inband memcpy by dw-axi-dmac
-    CMD_SPILOOP_TEST,  //test dma by PL08 using spi loopback
-    CMD_SPI_USERDMA_IB
+
+    CMD_DW_MEMCPY_IB_TEST,//USER_DMA: test inband memcpy by dw-axi-dmac
+    CMD_SPILOOP_TEST,     //PL08:     test dma by PL08 driver，using spi loopback
+    CMD_SPI_USERDMA_IB,   //USER_DMA: test spi loopback,using duplex dma in user_dma
+    CMD_DAC_CY_IB,         //USER_DMA: test dac tx,using dma in user_dma
+    CMD_DAC_CY_OOB         //USER_DMA: test dac tx,using dma in user_dma
 };
 
 enum Command parse_command(const char *arg) {
     if (strcmp(arg, "dw_mem_ib") == 0) return CMD_DW_MEMCPY_IB_TEST;
     if (strcmp(arg, "spi_driver_loop") == 0) return CMD_SPILOOP_TEST;
     if (strcmp(arg, "spi_userdma_ib") == 0) return CMD_SPI_USERDMA_IB;
+    if (strcmp(arg, "dac_cy_ib") == 0) return CMD_DAC_CY_IB;
+    if (strcmp(arg, "dac_cy_oob") == 0) return CMD_DAC_CY_OOB;
     return CMD_UNKNOWN;
 }
 
-#define USER_DMA_IOCTL_IB_TEST       _IOR('M', 1, int)  
-#define USER_DMA_IOCTL_SPI_LOOP_IB   _IOR('M', 2, int)//test inband spi dma loopback
+//ioctls
+#define USER_DMA_IOCTL_MEM_CPY_IB       _IOR('M', 1, int)  
+#define USER_DMA_IOCTL_SPI_TXRX_IB      _IOR('M', 2, int)//test inband spi dma loopback
+#define USER_DMA_IOCTL_DAC_TX_IB        _IOR('M', 3, int)//test inband dac dma-tx
+#define USER_DMA_IOCTL_DAC_TX_OOB       _IOR('M', 4, int)//test oob dac dma-tx
 
 int do_dw_memcpy_ib_test(void)
 {
@@ -41,7 +49,7 @@ int do_dw_memcpy_ib_test(void)
         perror("open");
         return EXIT_FAILURE;
     }
-    int ret = ioctl(fd, USER_DMA_IOCTL_IB_TEST,&value);
+    int ret = ioctl(fd, USER_DMA_IOCTL_MEM_CPY_IB,&value);
     if (ret < 0) {
         perror("ioctl");
         close(fd);
@@ -152,7 +160,7 @@ int do_spi_userdma_ib_test(void)
         perror("open");
         return EXIT_FAILURE;
     }
-    int ret = ioctl(fd, USER_DMA_IOCTL_SPI_LOOP_IB,&value);
+    int ret = ioctl(fd, USER_DMA_IOCTL_SPI_TXRX_IB,&value);
     if (ret < 0) {
         perror("ioctl");
         close(fd);
@@ -167,6 +175,61 @@ int do_spi_userdma_ib_test(void)
     close(fd);
     return 0;
 }
+
+int do_dac_dma_tx_ib(void)
+{
+    const char *dev = "/dev/user_dma";
+    int fd;
+    int value;
+
+    fd = open(dev, O_RDWR);
+    if (fd < 0) {
+        perror("open");
+        return EXIT_FAILURE;
+    }
+    int ret = ioctl(fd, USER_DMA_IOCTL_DAC_TX_IB,&value);
+    if (ret < 0) {
+        perror("ioctl");
+        close(fd);
+        return EXIT_FAILURE;
+    }
+    printf("inband dac dma-tx by user_dma executed finish\n");
+    if(value==0) {
+        printf("inband dac dma-tx success!\n");
+    } else {
+        printf("inband dac dma-tx error!\n");
+    }
+    close(fd);
+    return 0;
+}
+
+int do_dac_dma_tx_oob(void)
+{
+    const char *dev = "/dev/user_dma";
+    int fd;
+    int value;
+
+    fd = open(dev, O_RDWR);
+    if (fd < 0) {
+        perror("open");
+        return EXIT_FAILURE;
+    }
+    int ret = ioctl(fd, USER_DMA_IOCTL_DAC_TX_OOB,&value);
+    if (ret < 0) {
+        perror("ioctl");
+        close(fd);
+        return EXIT_FAILURE;
+    }
+    printf("oob dac dma-tx by user_dma executed finish\n");
+    if(value==0) {
+        printf("oob dac dma-tx success!\n");
+    } else {
+        printf("oob dac dma-tx error!\n");
+    }
+    close(fd);
+    return 0;
+}
+
 int main(int argc, char *argv[])
 {
     int ret = 0;
@@ -182,6 +245,14 @@ int main(int argc, char *argv[])
         }
         case CMD_SPI_USERDMA_IB: {
             ret = do_spi_userdma_ib_test();
+            break;
+        }
+        case CMD_DAC_CY_IB: {
+            ret = do_dac_dma_tx_ib();
+            break;
+        }
+        case CMD_DAC_CY_OOB:{
+            ret = do_dac_dma_tx_oob();
             break;
         }
         default:

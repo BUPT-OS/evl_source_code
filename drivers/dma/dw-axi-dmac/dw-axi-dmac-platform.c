@@ -1152,7 +1152,7 @@ out:
 static bool axi_chan_block_xfer_complete(struct axi_dma_chan *chan)
 {
 	int count = atomic_read(&chan->descs_allocated);
-	struct axi_dma_hw_desc *hw_desc;
+	struct axi_dma_hw_desc *hw_desc;//
 	struct axi_dma_desc *desc;
 	struct virt_dma_desc *vd;
 	unsigned long flags;
@@ -1176,14 +1176,44 @@ static bool axi_chan_block_xfer_complete(struct axi_dma_chan *chan)
 				ret = false;
 				goto out;
 		}
-		dmaengine_desc_get_callback(&vd->tx,&cb);//get callback
-		if(dmaengine_desc_callback_valid(&cb)) {
-			vchan_unlock_irqrestore(&chan->vc, flags);
-			dmaengine_desc_callback_invoke(&cb,NULL);
-			vchan_lock_irqsave(&chan->vc, flags);
+
+		if (chan->cyclic) {
+		desc = vd_to_axi_desc(vd);
+		if (desc) {
+			llp = lo_hi_readq(chan->chan_regs + CH_LLP);
+			for (i = 0; i < count; i++) {
+				hw_desc = &desc->hw_desc[i];
+				if (hw_desc->llp == llp) {
+					axi_chan_irq_clear(chan, hw_desc->lli->status_lo);
+					hw_desc->lli->ctl_hi |= CH_CTL_H_LLI_VALID;
+					desc->completed_blocks = i;
+
+					if (((hw_desc->len * (i + 1)) % desc->period_len) == 0) {
+						//1 cyclic period is over,time to call callback
+						dmaengine_desc_get_callback(&vd->tx,&cb);
+						if(dmaengine_desc_callback_valid(&cb)) {
+							vchan_unlock_irqrestore(&chan->vc, flags);
+							dmaengine_desc_callback_invoke(&cb,NULL);
+							vchan_lock_irqsave(&chan->vc, flags);
+						}
+					}
+					break;
+				}
+			}
+			axi_chan_enable(chan);
+			ret = true;
+			goto out;
 		}
-		ret = true;
-		goto out;
+		} else {
+			dmaengine_desc_get_callback(&vd->tx,&cb);//get callback
+			if(dmaengine_desc_callback_valid(&cb)) {
+				vchan_unlock_irqrestore(&chan->vc, flags);
+				dmaengine_desc_callback_invoke(&cb,NULL);
+				vchan_lock_irqsave(&chan->vc, flags);
+			}
+			ret = true;
+			goto out;
+		}
 	}
 
 	//ib:we don't care about ret in ib context,for we won't forward the irq again
@@ -1279,10 +1309,17 @@ static irqreturn_t dw_axi_dma_interrupt(int irq, void *dev_id)
 			axi_chan_irq_clear(chan, status);
 			dev_vdbg(chip->dev, "%s %u IRQ status: 0x%08x\n",
 				axi_chan_name(chan), i, status);
-			if (status & DWAXIDMAC_IRQ_ALL_ERR)
+
+			if (status & DWAXIDMAC_IRQ_ALL_ERR) {
 				axi_chan_handle_err(chan, status);
-			else if (status & DWAXIDMAC_IRQ_DMA_TRF)
+				pr_info("AXI_DAC:12\n");
+			}
+				
+			else if (status & DWAXIDMAC_IRQ_DMA_TRF) {
 				axi_chan_block_xfer_complete(chan);
+				pr_info("AXI_DAC:13\n");
+			}
+				
 		}
 	}
 
@@ -1301,7 +1338,7 @@ static int dma_chan_terminate_all(struct dma_chan *dchan)
 	LIST_HEAD(head);
 
 	axi_chan_disable(chan);
-
+	pr_info("dma_chan_terminate_all is called\n");
 	ret = readl_poll_timeout_atomic(chan->chip->regs + DMAC_CHEN, val,
 					!(val & chan_active), 1000, 50000);
 	if (ret == -ETIMEDOUT)

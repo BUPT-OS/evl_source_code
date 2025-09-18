@@ -25,26 +25,12 @@ enum Command {
     CMD_DAC_SG_OOB
 };
 
-// struct Cmd_element {
-//     const char * cmd_input;
-//     enum Command cmd;
-//     const char * cmd_desc;
-// }
-
-// const struct Cmd_element CMD_TABLE[] ={
-
-// }
-
-enum Command parse_command(const char *arg) {
-    if (strcmp(arg, "dw_mem_ib") == 0) return CMD_DW_MEMCPY_IB_TEST;
-    if (strcmp(arg, "spi_driver_loop") == 0) return CMD_SPILOOP_TEST;
-    if (strcmp(arg, "spi_userdma_ib") == 0) return CMD_SPI_USERDMA_IB;
-    if (strcmp(arg, "dac_cy_ib") == 0) return CMD_DAC_CY_IB;
-    if (strcmp(arg, "dac_cy_oob") == 0) return CMD_DAC_CY_OOB;
-    if (strcmp(arg, "dac_sg_ib") == 0) return CMD_DAC_SG_IB;
-    if (strcmp(arg, "dac_sg_oob") == 0) return CMD_DAC_SG_OOB;
-    return CMD_UNKNOWN;
-}
+struct Cmd_element {
+    const char * cmd_input;
+    enum Command cmd;
+    int (*cmd_callback)(void);
+    const char * cmd_desc;
+};
 
 //ioctls
 #define USER_DMA_IOCTL_MEM_CPY_IB       _IOR('M', 1, int)  
@@ -299,40 +285,50 @@ int do_dac_dma_sg_oob(void)
     close(fd);
     return 0;
 }
+
+
+const struct Cmd_element CMD_TABLE[] ={
+    {"dw_mem_ib"      , CMD_DW_MEMCPY_IB_TEST, do_dw_memcpy_ib_test   , "test inband memcpy by dw-dmac\n"},
+    {"spi_driver_loop", CMD_SPILOOP_TEST     , do_spi_loop_test       , "test inband spi loopback using pl022-spi driver\n"},
+    {"spi_userdma_ib" , CMD_SPI_USERDMA_IB   , do_spi_userdma_ib_test , "test inband spi loopback using user_dma\n"},
+    {"dac_cy_ib"      , CMD_DAC_CY_IB        , do_dac_dma_tx_ib       , "test inband cyclic mem2dev dma using dw-dmac and dac device\n"},
+    {"dac_cy_oob"     , CMD_DAC_CY_OOB       , do_dac_dma_tx_oob      , "test oob    cyclic mem2dev dma using dw-dmac and dac device\n"},
+    {"dac_sg_ib"      , CMD_DAC_SG_IB        , do_dac_dma_sg_ib       , "test inband sg     mem2dev dma using dw-dmac and dac device\n"},
+    {"dac_sg_oob"     , CMD_DAC_SG_OOB       , do_dac_dma_sg_oob      , "test oob    sg     mem2dev dma using dw-dmac and dac device\n"}
+};
+
+void print_help(void)
+{
+    printf("|%-20s| %s","INSTRUCTIONS","DESCRIBES\n");
+    for(int i=0;i<sizeof(CMD_TABLE)/sizeof(CMD_TABLE[0]);i++) {
+            printf("|%-20s| %s",CMD_TABLE[i].cmd_input,CMD_TABLE[i].cmd_desc);
+    }
+    return;
+}
+
+enum Command parse_command(const char *arg) {
+
+    for(int i=0;i<sizeof(CMD_TABLE)/sizeof(CMD_TABLE[0]);i++) {
+        if (strcmp(arg,CMD_TABLE[i].cmd_input) == 0) return CMD_TABLE[i].cmd;
+    }
+    return CMD_UNKNOWN;
+}
+
 int main(int argc, char *argv[])
 {
     int ret = 0;
+    enum Command input_cmd = parse_command(argv[1]);
+    if(input_cmd == CMD_UNKNOWN){
+        print_help();
+        return ret;
+    }
 
-    switch  (parse_command(argv[1])) { 
-        case CMD_DW_MEMCPY_IB_TEST: {
-            ret = do_dw_memcpy_ib_test();
-            break;            
-        }
-        case CMD_SPILOOP_TEST: {
-            ret = do_spi_loop_test();
+    for(int i=0;i<sizeof(CMD_TABLE)/sizeof(CMD_TABLE[0]);i++)
+    {
+        if(input_cmd == CMD_TABLE[i].cmd) {
+            ret = CMD_TABLE[i].cmd_callback();
             break;
         }
-        case CMD_SPI_USERDMA_IB: {
-            ret = do_spi_userdma_ib_test();
-            break;
-        }
-        case CMD_DAC_CY_IB: {
-            ret = do_dac_dma_tx_ib();
-            break;
-        }
-        case CMD_DAC_CY_OOB:{
-            ret = do_dac_dma_tx_oob();
-            break;
-        }
-        case CMD_DAC_SG_IB:{
-            ret = do_dac_dma_sg_ib();
-            break;
-        }
-        case CMD_DAC_SG_OOB:{
-            ret = do_dac_dma_sg_oob();
-        }
-        default:
-            printf("Unknown command: %s\n", argv[1]);
     }
 
     return ret;

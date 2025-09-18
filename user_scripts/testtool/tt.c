@@ -20,8 +20,20 @@ enum Command {
     CMD_SPILOOP_TEST,     //PL08:     test dma by PL08 driver，using spi loopback
     CMD_SPI_USERDMA_IB,   //USER_DMA: test spi loopback,using duplex dma in user_dma
     CMD_DAC_CY_IB,         //USER_DMA: test dac tx,using dma in user_dma
-    CMD_DAC_CY_OOB         //USER_DMA: test dac tx,using dma in user_dma
+    CMD_DAC_CY_OOB,         //USER_DMA: test dac tx,using dma in user_dma
+    CMD_DAC_SG_IB,
+    CMD_DAC_SG_OOB
 };
+
+// struct Cmd_element {
+//     const char * cmd_input;
+//     enum Command cmd;
+//     const char * cmd_desc;
+// }
+
+// const struct Cmd_element CMD_TABLE[] ={
+
+// }
 
 enum Command parse_command(const char *arg) {
     if (strcmp(arg, "dw_mem_ib") == 0) return CMD_DW_MEMCPY_IB_TEST;
@@ -29,14 +41,18 @@ enum Command parse_command(const char *arg) {
     if (strcmp(arg, "spi_userdma_ib") == 0) return CMD_SPI_USERDMA_IB;
     if (strcmp(arg, "dac_cy_ib") == 0) return CMD_DAC_CY_IB;
     if (strcmp(arg, "dac_cy_oob") == 0) return CMD_DAC_CY_OOB;
+    if (strcmp(arg, "dac_sg_ib") == 0) return CMD_DAC_SG_IB;
+    if (strcmp(arg, "dac_sg_oob") == 0) return CMD_DAC_SG_OOB;
     return CMD_UNKNOWN;
 }
 
 //ioctls
 #define USER_DMA_IOCTL_MEM_CPY_IB       _IOR('M', 1, int)  
 #define USER_DMA_IOCTL_SPI_TXRX_IB      _IOR('M', 2, int)//test inband spi dma loopback
-#define USER_DMA_IOCTL_DAC_TX_IB        _IOR('M', 3, int)//test inband dac dma-tx
-#define USER_DMA_IOCTL_DAC_TX_OOB       _IOR('M', 4, int)//test oob dac dma-tx
+#define USER_DMA_IOCTL_DACcy_TX_IB      _IOR('M', 3, int)//test inband dac dma-tx
+#define USER_DMA_IOCTL_DACcy_TX_OOB     _IOR('M', 4, int)//test oob dac dma-tx
+#define USER_DMA_IOCTL_DACsg_TX_IB      _IOR('M', 5, int)//test inband dac dma sg tx
+#define USER_DMA_IOCTL_DACsg_TX_OOB     _IOR('M', 6, int)//test oob dac dma sg tx
 
 int do_dw_memcpy_ib_test(void)
 {
@@ -187,7 +203,7 @@ int do_dac_dma_tx_ib(void)
         perror("open");
         return EXIT_FAILURE;
     }
-    int ret = ioctl(fd, USER_DMA_IOCTL_DAC_TX_IB,&value);
+    int ret = ioctl(fd, USER_DMA_IOCTL_DACcy_TX_IB,&value);
     if (ret < 0) {
         perror("ioctl");
         close(fd);
@@ -214,7 +230,7 @@ int do_dac_dma_tx_oob(void)
         perror("open");
         return EXIT_FAILURE;
     }
-    int ret = ioctl(fd, USER_DMA_IOCTL_DAC_TX_OOB,&value);
+    int ret = ioctl(fd, USER_DMA_IOCTL_DACcy_TX_OOB,&value);
     if (ret < 0) {
         perror("ioctl");
         close(fd);
@@ -230,6 +246,59 @@ int do_dac_dma_tx_oob(void)
     return 0;
 }
 
+int do_dac_dma_sg_ib(void)
+{
+    const char *dev = "/dev/user_dma";
+    int fd;
+    int value;
+
+    fd = open(dev, O_RDWR);
+    if (fd < 0) {
+        perror("open");
+        return EXIT_FAILURE;
+    }
+    int ret = ioctl(fd, USER_DMA_IOCTL_DACsg_TX_IB,&value);
+    if (ret < 0) {
+        perror("ioctl");
+        close(fd);
+        return EXIT_FAILURE;
+    }
+    printf("ib dac dma-sg by user_dma executed finish\n");
+    if(value==0) {
+        printf("ib dac dma-sg success!\n");
+    } else {
+        printf("ib dac dma-sg error!\n");
+    }
+    close(fd);
+    return 0;
+}
+
+int do_dac_dma_sg_oob(void)
+{
+    const char *dev = "/dev/user_dma";
+    int fd;
+    int value;
+
+    fd = open(dev, O_RDWR);
+    if (fd < 0) {
+        perror("open");
+        return EXIT_FAILURE;
+    }
+    int ret = ioctl(fd, USER_DMA_IOCTL_DACsg_TX_OOB,&value);
+    if (ret < 0) {
+        perror("ioctl");
+        close(fd);
+        return EXIT_FAILURE;
+    }
+    printf("oob dac dma-sg by user_dma executed finish\n");
+    if(value==0) {
+        printf("oob dac dma-sg success!\n");
+    } else {
+        printf("oob dac dma-sg error!\n");
+    }
+    close(fd);
+    return 0;
+}
 int main(int argc, char *argv[])
 {
     int ret = 0;
@@ -254,6 +323,13 @@ int main(int argc, char *argv[])
         case CMD_DAC_CY_OOB:{
             ret = do_dac_dma_tx_oob();
             break;
+        }
+        case CMD_DAC_SG_IB:{
+            ret = do_dac_dma_sg_ib();
+            break;
+        }
+        case CMD_DAC_SG_OOB:{
+            ret = do_dac_dma_sg_oob();
         }
         default:
             printf("Unknown command: %s\n", argv[1]);

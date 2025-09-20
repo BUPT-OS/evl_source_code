@@ -521,17 +521,17 @@ static int dw_axi_dma_pulse_oob(struct dma_chan *dchan)
 {
 	struct axi_dma_chan *chan = dchan_to_axi_dma_chan(dchan);
 	struct virt_dma_desc *vd;
+	struct axi_dma_desc *desc;
 	unsigned long flags;
 	int ret = -EIO;
 
 	pr_info("pulse oob called\n");
 	vchan_lock_irqsave(&chan->vc, flags);
-	//todo:get the first desc(should be oob) in vc,and start
 	vd = vchan_next_desc(&chan->vc);
-	chan->desc = (vd==NULL)?(NULL):(vd_to_axi_desc(vd));//the desc that is in progress
-	if (chan->desc && vchan_oob_pulsed(&chan->desc->vd)) {
+	desc = (vd==NULL)?(NULL):(vd_to_axi_desc(vd));
+	if (desc && vchan_oob_pulsed(&desc->vd)) {
 		pr_info("pulse:1\n");
-		axi_chan_block_xfer_start(chan,chan->desc);
+		axi_chan_block_xfer_start(chan,desc);
 		ret = 0;
 	}
 	vchan_unlock_irqrestore(&chan->vc, flags);
@@ -1231,13 +1231,11 @@ static bool axi_chan_block_xfer_complete(struct axi_dma_chan *chan)
 			//free the vd in completed list
 			list_del(&vd->node);
 			vchan_vdesc_fini(vd);
-			//clear chan->desc,which is set at pulse_oob
-			chan->desc = NULL;
 			//if there is vd,continue to execute
 			vd = vchan_next_desc(&chan->vc);
-			chan->desc = (vd==NULL)?(NULL):(vd_to_axi_desc(vd));
+			desc = (vd==NULL)?(NULL):(vd_to_axi_desc(vd));
 			if(vd) {
-				axi_chan_block_xfer_start(chan,chan->desc);
+				axi_chan_block_xfer_start(chan,desc);
 			}
 			ret = true;
 			goto out;

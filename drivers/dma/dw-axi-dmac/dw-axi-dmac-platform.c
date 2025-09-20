@@ -1216,24 +1216,27 @@ static bool axi_chan_block_xfer_complete(struct axi_dma_chan *chan)
 				goto out;
 			}
 		} else {
+			/* Remove the completed descriptor from issued list before completing */
+			list_del(&vd->node);
+			//complete the desc cookie manually
+			dma_cookie_complete(&vd->tx);
+			list_add_tail(&vd->node, &(chan->vc.desc_completed));
+			//vd is in completed list right now
 			dmaengine_desc_get_callback(&vd->tx,&cb);//get callback
 			if(dmaengine_desc_callback_valid(&cb)) {
 				vchan_unlock_irqrestore(&chan->vc, flags);
 				dmaengine_desc_callback_invoke(&cb,NULL);
 				vchan_lock_irqsave(&chan->vc, flags);
 			}
-			/* Remove the completed descriptor from issued list before completing */
+			//free the vd in completed list
 			list_del(&vd->node);
-			//complete the desc manually
-			dma_cookie_complete(&vd->tx);
-			list_add_tail(&vd->node, &(chan->vc.desc_completed));
+			vchan_vdesc_fini(vd);
 			//clear chan->desc,which is set at pulse_oob
 			chan->desc = NULL;
-			//if the next vd is oob,continue to execute
+			//if there is vd,continue to execute
 			vd = vchan_next_desc(&chan->vc);
-			desc = (vd==NULL)?(NULL):(vd_to_axi_desc(vd));
-			if(vd && vchan_oob_pulsed(vd)) {
-				chan->desc = desc;
+			chan->desc = (vd==NULL)?(NULL):(vd_to_axi_desc(vd));
+			if(vd) {
 				axi_chan_block_xfer_start(chan,chan->desc);
 			}
 			ret = true;

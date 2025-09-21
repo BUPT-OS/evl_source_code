@@ -22,7 +22,8 @@ enum Command {
     CMD_DAC_CY_IB,         //USER_DMA: test dac tx,using dma in user_dma
     CMD_DAC_CY_OOB,         //USER_DMA: test dac tx,using dma in user_dma
     CMD_DAC_SG_IB,
-    CMD_DAC_SG_OOB
+    CMD_DAC_SG_OOB,
+    CMD_DAC_SG_MIX
 };
 
 struct Cmd_element {
@@ -39,6 +40,7 @@ struct Cmd_element {
 #define USER_DMA_IOCTL_DACcy_TX_OOB     _IOR('M', 4, int)//test oob dac dma-tx
 #define USER_DMA_IOCTL_DACsg_TX_IB      _IOR('M', 5, int)//test inband dac dma sg tx
 #define USER_DMA_IOCTL_DACsg_TX_OOB     _IOR('M', 6, int)//test oob dac dma sg tx
+#define USER_DMA_IOCTL_DACsg_TX_MIX   _IOR('M', 7, int)//test oob dac dma sg tx
 
 int do_dw_memcpy_ib_test(void)
 {
@@ -286,6 +288,33 @@ int do_dac_dma_sg_oob(void)
     return 0;
 }
 
+int do_dac_dma_sg_mix(void)
+{
+    const char *dev = "/dev/user_dma";
+    int fd;
+    int value;
+
+    fd = open(dev, O_RDWR);
+    if (fd < 0) {
+        perror("open");
+        return EXIT_FAILURE;
+    }
+    int ret = ioctl(fd, USER_DMA_IOCTL_DACsg_TX_MIX,&value);
+    if (ret < 0) {
+        perror("ioctl");
+        close(fd);
+        return EXIT_FAILURE;
+    }
+    printf("oob dac dma-sg by user_dma executed finish\n");
+    if(value==0) {
+        printf("oob dac dma-sg success!\n");
+    } else {
+        printf("oob dac dma-sg error!\n");
+    }
+    close(fd);
+    return 0;
+}
+
 
 const struct Cmd_element CMD_TABLE[] ={
     {"dw_mem_ib"      , CMD_DW_MEMCPY_IB_TEST, do_dw_memcpy_ib_test   , "test inband memcpy by dw-dmac\n"},
@@ -294,7 +323,8 @@ const struct Cmd_element CMD_TABLE[] ={
     {"dac_cy_ib"      , CMD_DAC_CY_IB        , do_dac_dma_tx_ib       , "test inband cyclic mem2dev dma using dw-dmac and dac device\n"},
     {"dac_cy_oob"     , CMD_DAC_CY_OOB       , do_dac_dma_tx_oob      , "test oob    cyclic mem2dev dma using dw-dmac and dac device\n"},
     {"dac_sg_ib"      , CMD_DAC_SG_IB        , do_dac_dma_sg_ib       , "test inband sg     mem2dev dma using dw-dmac and dac device\n"},
-    {"dac_sg_oob"     , CMD_DAC_SG_OOB       , do_dac_dma_sg_oob      , "test oob    sg     mem2dev dma using dw-dmac and dac device\n"}
+    {"dac_sg_oob"     , CMD_DAC_SG_OOB       , do_dac_dma_sg_oob      , "test oob    sg     mem2dev dma using dw-dmac and dac device\n"},
+    {"dac_sg_mix"     , CMD_DAC_SG_MIX       , do_dac_dma_sg_mix      , "test the trigger sequence of mixed ib/oob descs\n"}
 };
 
 void print_help(void)

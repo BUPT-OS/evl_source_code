@@ -511,7 +511,7 @@ static void dma_chan_issue_pending(struct dma_chan *dchan)
 	unsigned long flags;
 
 	vchan_lock_irqsave(&chan->vc,flags);
-	if (vchan_issue_pending(&chan->vc))
+	if (vchan_issue_pending_mix(&chan->vc))
 		axi_chan_start_first_queued(chan);
 	vchan_unlock_irqrestore(&chan->vc,flags);
 }

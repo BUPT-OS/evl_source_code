@@ -36,6 +36,28 @@ dma_cookie_t vchan_tx_submit(struct dma_async_tx_descriptor *tx)
 }
 EXPORT_SYMBOL_GPL(vchan_tx_submit);
 
+dma_cookie_t vchan_tx_submit_mix(struct dma_async_tx_descriptor *tx)
+{
+	struct virt_dma_chan *vc = to_virt_chan(tx->chan);
+	struct virt_dma_desc *vd = to_virt_desc(tx);
+	unsigned long flags;
+	dma_cookie_t cookie;
+
+	vchan_lock_irqsave(vc, flags);
+	cookie = dma_cookie_assign(tx);
+	if(tx->flags & DMA_OOB_PULSE)
+		list_move_tail(&vd->node, &vc->desc_submitted_oob);
+	else
+		list_move_tail(&vd->node, &vc->desc_submitted);
+	vchan_unlock_irqrestore(vc, flags);
+
+	dev_dbg(vc->chan.device->dev, "vchan %p: txd %p[%x]: submitted\n",
+		vc, vd, cookie);
+
+	return cookie;
+}
+EXPORT_SYMBOL_GPL(vchan_tx_submit_mix);
+
 /**
  * vchan_tx_desc_free - free a reusable descriptor
  * @tx: the transfer
@@ -127,6 +149,7 @@ void vchan_init(struct virt_dma_chan *vc, struct dma_device *dmadev)
 	spin_lock_init(&vc->lock);
 	INIT_LIST_HEAD(&vc->desc_allocated);
 	INIT_LIST_HEAD(&vc->desc_submitted);
+	INIT_LIST_HEAD(&vc->desc_submitted_oob);
 	INIT_LIST_HEAD(&vc->desc_issued);
 	INIT_LIST_HEAD(&vc->desc_completed);
 	INIT_LIST_HEAD(&vc->desc_terminated);

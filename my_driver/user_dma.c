@@ -510,6 +510,8 @@ static void mocking_jh7110_pwmdac_hw_params(struct jh7110_pwmdac_dev *dev)
 
 #define PWMDAC_ADDR      0x100b0000
 
+#define MIX_TEST_DESC_LEN 4
+
 //USER_DMA_IOCTL_<device>_<direction:CPY_TX_RX>_<IB/OOB>
 #define USER_DMA_IOCTL_MEM_CPY_IB     _IOR('M', 1, int)//test inband memcpy by dw-axi-dmac
 #define USER_DMA_IOCTL_SPI_TXRX_IB    _IOR('M', 2, int)//test inband spi dma loopback
@@ -517,6 +519,7 @@ static void mocking_jh7110_pwmdac_hw_params(struct jh7110_pwmdac_dev *dev)
 #define USER_DMA_IOCTL_DACcy_TX_OOB     _IOR('M', 4, int)//test oob dac cyclic dma tx
 #define USER_DMA_IOCTL_DACsg_TX_IB    _IOR('M', 5, int)//test inband dac dma sg tx
 #define USER_DMA_IOCTL_DACsg_TX_OOB   _IOR('M', 6, int)//test oob dac dma sg tx
+#define USER_DMA_IOCTL_DACsg_TX_MIX   _IOR('M', 7, int)//test oob dac dma sg tx
 struct transfer_config {
     //bus addr that dmac can use
     dma_addr_t dma_buf_src;
@@ -528,6 +531,7 @@ struct transfer_config {
 
 struct my_cb_param {
     const char *log;             
+    int submit_index;
     int target_cnt;
     int cnt;
     struct completion done;       // 用于同步的 completion
@@ -569,8 +573,11 @@ static void cb_ib(void *param)
     params->cnt = params->cnt + 1;
     if(params->cnt == params->target_cnt) 
         complete(&params->done);
+    pr_info("--------------------\n");
     pr_info("%s\n",params->log);
+    pr_info("submit index = %d\n",params->submit_index);
     pr_info("cnt = %d,target_cnt = %d\n",params->cnt,params->target_cnt);
+    pr_info("--------------------\n");
     return;
 }
 
@@ -581,9 +588,12 @@ static void cb_oob(void *param)
     if(params->cnt == params->target_cnt) 
         complete(&params->done);
     if(running_oob()) {
+        pr_info("--------------------\n");
         pr_info("%s\n",params->log);
         pr_info("running oob\n");
+        pr_info("submit index = %d\n",params->submit_index);
         pr_info("cnt = %d,target_cnt = %d\n",params->cnt,params->target_cnt);
+        pr_info("--------------------\n");
     }        
     return;
 }
@@ -797,6 +807,7 @@ static int do_dw_mem_cp_ib_test(void)
 
     init_completion(&params.done);
     params.log = "MEM:inband memcpy by dw-axi-dmac cb is called";
+    params.submit_index = 0;
     params.cnt = 0;
     params.target_cnt = 1;
     //prepare
@@ -878,6 +889,7 @@ static int do_pl08_spi_sg_ib_test(void)
     // ini params
     init_completion(&params.done);
     params.log = "SPI:inband spi-rx dma callback by PL08-dmac is called";
+    params.submit_index = 0;
     params.cnt = 0;
     params.target_cnt = 1;
     //config dma channel
@@ -990,9 +1002,10 @@ static int do_dw_dac_cy_ib_test(void)
     fill_source_buffer(&trans_config);
 
     init_completion(&params.done);
-    params.log        = "DAC:inband m2d dma by dw-axi-dmac cb is called";
-    params.cnt        = 0;
-    params.target_cnt = 2*BUF_LEN/xfer_len;
+    params.log          = "DAC:inband m2d dma by dw-axi-dmac cb is called";
+    params.submit_index = 0;
+    params.cnt          = 0;
+    params.target_cnt   = 2*BUF_LEN/xfer_len;
     pr_info("target_cnt:%d\n",params.target_cnt);
     //mocking jh7110_pwmdac_hw_params
     enable_dac();
@@ -1106,9 +1119,10 @@ static int do_dw_dac_cy_oob_test(void)
     fill_source_buffer(&trans_config);
     //setting params
     init_completion(&params.done);
-    params.log        = "DAC:oob m2d dma by dw-axi-dmac cb is called";
-    params.cnt        = 0;
-    params.target_cnt = 2*BUF_LEN/xfer_len;
+    params.log          = "DAC:oob m2d dma by dw-axi-dmac cb is called";
+    params.submit_index = 0;
+    params.cnt          = 0;
+    params.target_cnt   = 2*BUF_LEN/xfer_len;
     pr_info("target_cnt:%d\n",params.target_cnt);
     //mocking jh7110_pwmdac_hw_params
     enable_dac();
@@ -1209,9 +1223,10 @@ static int do_dw_dac_sg_ib_test(void)
 
     //setting params
     init_completion(&params.done);
-    params.log        = "DAC:ib m2d dma by dw-axi-dmac cb is called";
-    params.cnt        = 0;
-    params.target_cnt = 1;
+    params.log          = "DAC:ib m2d dma by dw-axi-dmac cb is called";
+    params.submit_index = 0;
+    params.cnt          = 0;
+    params.target_cnt   = 1;
     pr_info("target_cnt:%d\n",params.target_cnt);
     //mocking jh7110_pwmdac_hw_params
     enable_dac();
@@ -1310,9 +1325,10 @@ static int do_dw_dac_sg_oob_test(void)
 
     //setting params
     init_completion(&params.done);
-    params.log        = "DAC:oob m2d dma by dw-axi-dmac cb is called";
-    params.cnt        = 0;
-    params.target_cnt = 1;
+    params.log          = "DAC:oob m2d dma by dw-axi-dmac cb is called";
+    params.submit_index = 0;
+    params.cnt          = 0;
+    params.target_cnt   = 1;
     pr_info("target_cnt:%d\n",params.target_cnt);
     //mocking jh7110_pwmdac_hw_params
     enable_dac();
@@ -1371,6 +1387,133 @@ chan_exit:
     return ret;
 }
 
+static int do_dw_dac_sg_mix_test(void)
+{
+    int ret = 0;
+    struct transfer_config trans_config;
+    struct scatterlist sg_tx[1];
+    struct my_cb_param params[MIX_TEST_DESC_LEN];
+    bool   oob_desc_sel[MIX_TEST_DESC_LEN] = {false,false,true,true};
+    bool   wait_success                    = true;
+
+    dma_cap_mask_t mask;
+    struct dma_chan *dchan;
+    struct dma_slave_config chan_tx_config = {0};
+
+    struct dma_async_tx_descriptor *tx[MIX_TEST_DESC_LEN];
+    size_t xfer_len = 4096;
+    dma_cookie_t cookie_tx[MIX_TEST_DESC_LEN];
+
+    //get channel 
+    dma_cap_zero(mask);
+    dma_cap_set(DMA_SLAVE, mask);
+    dchan = dma_request_chan(&pdev_dac->dev, "tx");
+    if (IS_ERR(dchan)) {
+        pr_err("Failed to request DMA channel\n");
+        ret = 1;
+        goto chan_exit;
+    } else {
+        if(dchan && dchan->device && dchan->device->dev)
+            pr_info("Got dw m2d channel success: %s\n", dma_chan_name(dchan));            
+    }
+    //allocate dma reachable buffer
+    if(!allocate_trans_config(&trans_config,dchan->device->dev)) {
+        ret = 1;
+        goto trans_config_exit;
+    }
+    fill_source_buffer(&trans_config);
+    //init scatter list
+    sg_init_table(sg_tx, 1);
+    sg_init_one(&sg_tx[0], trans_config.buf_src, xfer_len);        
+
+    sg_dma_address(&sg_tx[0]) = trans_config.dma_buf_src;
+    sg_dma_len(&sg_tx[0])     = xfer_len;
+
+    //setting params
+    for(int i=0;i<MIX_TEST_DESC_LEN;i++)
+    {
+        init_completion(&(params[i].done));
+        if(oob_desc_sel[i])
+            params[i].log        = "DAC:oob m2d dma by dw-axi-dmac cb is called";
+        else 
+            params[i].log        = "DAC:ib m2d dma by dw-axi-dmac cb is called";
+        params[i].submit_index = i;
+        params[i].cnt          = 0;
+        params[i].target_cnt   = 1;
+    }
+    //mocking jh7110_pwmdac_hw_params
+    enable_dac();
+    mocking_jh7110_pwmdac_hw_params(pwmdac);
+
+    //slave config
+    memset(&chan_tx_config, 0, sizeof(chan_tx_config));
+    chan_tx_config.direction      = DMA_MEM_TO_DEV;
+    chan_tx_config.dst_addr       = PWMDAC_ADDR;
+    chan_tx_config.dst_addr_width = DMA_SLAVE_BUSWIDTH_2_BYTES;//
+    chan_tx_config.dst_maxburst   = 16;//
+    chan_tx_config.device_fc      = false;
+    dmaengine_slave_config(dchan, &chan_tx_config);
+    
+    //prepare dma desc
+    for(int i=0;i<MIX_TEST_DESC_LEN;i++)
+    {
+        unsigned long flags = 0;
+        if(oob_desc_sel[i])
+            flags = DMA_PREP_INTERRUPT | DMA_CTRL_ACK | DMA_OOB_INTERRUPT | DMA_OOB_PULSE;
+        else 
+            flags = DMA_PREP_INTERRUPT | DMA_CTRL_ACK;
+        tx[i] = dmaengine_prep_slave_sg(dchan,
+            sg_tx, 
+            1, 
+            DMA_MEM_TO_DEV, 
+            flags
+        );
+        if(oob_desc_sel[i])
+            tx[i]->callback = cb_oob;        
+        else
+            tx[i]->callback = cb_ib;       
+        tx[i]->callback_param = params+i;
+    }
+    //submit
+    for(int i = 0 ; i<MIX_TEST_DESC_LEN ; i++)
+    {
+        cookie_tx[i] = dmaengine_submit(tx[i]);
+    }
+
+    //trigger the tranfer by pulse_oob
+    dma_async_issue_pending(dchan);//oob desc will be filted here
+    dma_pulse_oob(dchan);//real trigger
+
+    jh7110_pwmdac_set(pwmdac);
+    dump_pwmdac_regs(pwmdac->base);
+    for(int i = 0;i<MIX_TEST_DESC_LEN;i++) 
+    {
+        if(!wait_for_completion_timeout(&(params[i].done),msecs_to_jiffies(10000)))
+        {
+            wait_success = false;
+            pr_err("tx DMA timeout error!\n");
+        } 
+    }
+    if(wait_success)
+    {
+        pr_info("wait success\n");
+    }
+    
+    jh7110_pwmdac_stop(pwmdac);
+    disable_dac();
+
+    dmaengine_pause(dchan);
+    msleep(1);
+    dmaengine_terminate_sync(dchan);
+    //release trans_config
+    release_trans_config(&trans_config,dchan->device->dev);
+trans_config_exit:
+
+    dma_release_channel(dchan);
+chan_exit:
+    return ret;
+}
+
 static long user_dma_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
     int output;
@@ -1411,6 +1554,13 @@ static long user_dma_ioctl(struct file *file, unsigned int cmd, unsigned long ar
                 return -EFAULT;
             break;
         }
+        case USER_DMA_IOCTL_DACsg_TX_MIX:{
+            output = do_dw_dac_sg_mix_test();
+            if (copy_to_user((int __user *)arg, &output, sizeof(output)))
+                return -EFAULT;
+            break;
+        }
+
         default:
             return -ENOTTY;
         return 0;

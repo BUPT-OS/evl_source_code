@@ -29,6 +29,7 @@ struct virt_dma_chan {
 	/* protected by vc.lock */
 	struct list_head desc_allocated;
 	struct list_head desc_submitted;
+	struct list_head desc_submitted_oob;
 	struct list_head desc_issued;
 	struct list_head desc_completed;
 	struct list_head desc_terminated;
@@ -45,6 +46,7 @@ void vchan_dma_desc_free_list(struct virt_dma_chan *vc, struct list_head *head);
 void vchan_init(struct virt_dma_chan *vc, struct dma_device *dmadev);
 struct virt_dma_desc *vchan_find_desc(struct virt_dma_chan *, dma_cookie_t);
 extern dma_cookie_t vchan_tx_submit(struct dma_async_tx_descriptor *);
+extern dma_cookie_t vchan_tx_submit_mix(struct dma_async_tx_descriptor *);
 extern int vchan_tx_desc_free(struct dma_async_tx_descriptor *);
 
 /**
@@ -60,7 +62,7 @@ static inline struct dma_async_tx_descriptor *vchan_tx_prep(struct virt_dma_chan
 
 	dma_async_tx_descriptor_init(&vd->tx, &vc->chan);
 	vd->tx.flags = tx_flags;
-	vd->tx.tx_submit = vchan_tx_submit;
+	vd->tx.tx_submit = vchan_tx_submit_mix;
 	vd->tx.desc_free = vchan_tx_desc_free;
 
 	vd->tx_result.result = DMA_TRANS_NOERROR;
@@ -71,6 +73,37 @@ static inline struct dma_async_tx_descriptor *vchan_tx_prep(struct virt_dma_chan
 	spin_unlock_irqrestore(&vc->lock, flags);
 
 	return &vd->tx;
+}
+
+/**
+ * vchan_issue_pending_mix - move submitted ib and oob descriptors to issued list
+ * @vc: virtual channel to update
+ *
+ * vc.lock must be held by caller
+ */
+static inline bool vchan_issue_pending_mix(struct virt_dma_chan *vc)
+{
+	lockdep_assert_held(&vc->lock);
+	struct virt_dma_desc *vd;
+	bool oob_found = false;
+	//insert oob descs
+	if(!list_empty(&vc->desc_submitted_oob)) {
+		list_for_each_entry_reverse(vd, &vc->desc_issued, node) {
+        if (vchan_oob_pulsed(vd)) {
+				// 把 desc_submitted_oob 插到这个 OOB 描述符的后面
+				oob_found = true;
+				list_splice_init(&vc->desc_submitted_oob, &vd->node);
+				break;
+        	}
+    	}
+		if(!oob_found)  
+			list_splice_init(&vc->desc_submitted_oob, &vc->desc_issued);
+	}
+	//add ib descs to tail
+	list_splice_tail_init(&vc->desc_submitted, &vc->desc_issued);
+
+	
+	return !list_empty(&vc->desc_issued);
 }
 
 /**
@@ -189,6 +222,7 @@ static inline void vchan_get_all_descriptors(struct virt_dma_chan *vc,
 
 	list_splice_tail_init(&vc->desc_allocated, head);
 	list_splice_tail_init(&vc->desc_submitted, head);
+	list_splice_tail_init(&vc->desc_submitted_oob, head);
 	list_splice_tail_init(&vc->desc_issued, head);
 	list_splice_tail_init(&vc->desc_completed, head);
 	list_splice_tail_init(&vc->desc_terminated, head);

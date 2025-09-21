@@ -876,22 +876,26 @@ static int do_pl08_spi_sg_ib_test(void)
             pr_info("Got PL08 rx channel: %s\n", dma_chan_name(dchan_rx));
         }
     }
+
     //allocate dma reachable buffer
     if(!allocate_trans_config(&trans_config,dchan_tx->device->dev)) {
         ret = 1;
         goto trans_config_exit;
     }
+
     fill_source_buffer(&trans_config);
     memset(trans_config.buf_des,0,BUF_LEN);
     spi_dma_config(spi.virt_addr);
     print_spi_regs(spi.virt_addr);
     pr_info("\nPL022 spi config and enable sucess\n");
+
     // ini params
     init_completion(&params.done);
     params.log = "SPI:inband spi-rx dma callback by PL08-dmac is called";
     params.submit_index = 0;
     params.cnt = 0;
     params.target_cnt = 1;
+
     //config dma channel
     //tx
     chan_tx_config.direction      = DMA_MEM_TO_DEV;
@@ -1006,7 +1010,7 @@ static int do_dw_dac_cy_ib_test(void)
     params.submit_index = 0;
     params.cnt          = 0;
     params.target_cnt   = 2*BUF_LEN/xfer_len;
-    pr_info("target_cnt:%d\n",params.target_cnt);
+
     //mocking jh7110_pwmdac_hw_params
     enable_dac();
     mocking_jh7110_pwmdac_hw_params(pwmdac);
@@ -1030,10 +1034,9 @@ static int do_dw_dac_cy_ib_test(void)
     tx->callback       = cb_ib;
     tx->callback_param = &params;
 
-    pr_info("dma prepare sucess\n");
+    pr_info("dma prepare success\n");
     //submit
     cookie_tx = dmaengine_submit(tx);
-    pr_info("TX cookie=%u\n", cookie_tx);
 
     dma_async_issue_pending(dchan);
     
@@ -1041,27 +1044,21 @@ static int do_dw_dac_cy_ib_test(void)
     dump_pwmdac_regs(pwmdac->base);
     if (!wait_for_completion_timeout(&params.done, msecs_to_jiffies(10000))) {
         pr_err("tx DMA timeout error!\n");
-        jh7110_pwmdac_stop(pwmdac);
         dump_pwmdac_regs(pwmdac->base);
-        pr_info("pl dma channels terminated\n");
     } else {
-        jh7110_pwmdac_stop(pwmdac);
+        
         pr_info("wait success\n");
     }
+    jh7110_pwmdac_stop(pwmdac);
     dmaengine_pause(dchan);
     disable_dac();
     
-    
-    msleep(10);
-    // dmaengine_terminate_sync(dchan);
-    //release trans_config
     release_trans_config(&trans_config,dchan->device->dev);
 trans_config_exit:
     status = dmaengine_tx_status(dchan,cookie_tx, &state);
 
     pr_info("DMA status raw: %d\n", status);
 
-    /* 打印每种状态标志 */
     if (status & DMA_COMPLETE)
         pr_info("  DMA_COMPLETE\n");
     if (status & DMA_PAUSED)
@@ -1071,7 +1068,6 @@ trans_config_exit:
     if (status & DMA_IN_PROGRESS)
         pr_info("  DMA_IN_PROGRESS\n");
 
-    /* 打印 dma_tx_state 内容 */
     pr_info("DMA residue: %u\n", state.residue);
 
     if (status == DMA_PAUSED) {
@@ -1080,6 +1076,7 @@ trans_config_exit:
     }
     dmaengine_terminate_async(dchan);
     dma_release_channel(dchan);
+    pr_info("cyclic occupied dma-channel may not be released successfully,must reboot system to test other functions\n");
 chan_exit:
     return ret;
 }
@@ -1096,8 +1093,7 @@ static int do_dw_dac_cy_oob_test(void)
     struct dma_async_tx_descriptor *tx;
     size_t xfer_len = 1024;
     dma_cookie_t cookie_tx;
-    struct dma_tx_state state;
-	enum dma_status status;
+
     //get channel 
     dma_cap_zero(mask);
     dma_cap_set(DMA_SLAVE, mask);
@@ -1110,13 +1106,14 @@ static int do_dw_dac_cy_oob_test(void)
         if(dchan && dchan->device && dchan->device->dev)
             pr_info("Got dw m2d channel success: %s\n", dma_chan_name(dchan));            
     }
+
     //allocate dma reachable buffer
     if(!allocate_trans_config(&trans_config,dchan->device->dev)) {
         ret = 1;
         goto trans_config_exit;
     }
-
     fill_source_buffer(&trans_config);
+
     //setting params
     init_completion(&params.done);
     params.log          = "DAC:oob m2d dma by dw-axi-dmac cb is called";
@@ -1149,7 +1146,6 @@ static int do_dw_dac_cy_oob_test(void)
     tx->callback_param = &params;
     //submit
     cookie_tx = dmaengine_submit(tx);
-    pr_info("TX cookie=%u\n", cookie_tx);
 
     dma_async_issue_pending(dchan);
 
@@ -1157,15 +1153,13 @@ static int do_dw_dac_cy_oob_test(void)
     dump_pwmdac_regs(pwmdac->base);
     if (!wait_for_completion_timeout(&params.done, msecs_to_jiffies(10000))) {
         pr_err("tx DMA timeout error!\n");
-        jh7110_pwmdac_stop(pwmdac);
         dump_pwmdac_regs(pwmdac->base);
-        pr_info("pl dma channels terminated\n");
     } else {
-        jh7110_pwmdac_stop(pwmdac);
         pr_info("wait success\n");
     }
-    disable_dac();
 
+    jh7110_pwmdac_stop(pwmdac);
+    disable_dac();
 
     dmaengine_pause(dchan);
     msleep(1);
@@ -1173,10 +1167,9 @@ static int do_dw_dac_cy_oob_test(void)
     //release trans_config
     release_trans_config(&trans_config,dchan->device->dev);
 trans_config_exit:
-    status = dmaengine_tx_status(dchan,cookie_tx, &state);
-    if (status == DMA_PAUSED)
-		dmaengine_terminate_async(dchan);
+
     dma_release_channel(dchan);
+    pr_info("cyclic occupied dma-channel may not be released successfully,must reboot system to test other functions\n");
 chan_exit:
     return ret;
 }
@@ -1194,8 +1187,7 @@ static int do_dw_dac_sg_ib_test(void)
     struct dma_async_tx_descriptor *tx;
     size_t xfer_len = 4096;
     dma_cookie_t cookie_tx;
-    struct dma_tx_state state;
-	enum dma_status status;
+
     //get channel 
     dma_cap_zero(mask);
     dma_cap_set(DMA_SLAVE, mask);
@@ -1208,11 +1200,13 @@ static int do_dw_dac_sg_ib_test(void)
         if(dchan && dchan->device && dchan->device->dev)
             pr_info("Got dw m2d channel success: %s\n", dma_chan_name(dchan));            
     }
+
     //allocate dma reachable buffer
     if(!allocate_trans_config(&trans_config,dchan->device->dev)) {
         ret = 1;
         goto trans_config_exit;
     }
+
     fill_source_buffer(&trans_config);
     //init scatter list
     sg_init_table(sg_tx, 1);
@@ -1260,13 +1254,11 @@ static int do_dw_dac_sg_ib_test(void)
     dump_pwmdac_regs(pwmdac->base);
     if (!wait_for_completion_timeout(&params.done, msecs_to_jiffies(10000))) {
         pr_err("tx DMA timeout error!\n");
-        jh7110_pwmdac_stop(pwmdac);
         dump_pwmdac_regs(pwmdac->base);
-        pr_info("pl dma channels terminated\n");
     } else {
-        jh7110_pwmdac_stop(pwmdac);
         pr_info("wait success\n");
     }
+    jh7110_pwmdac_stop(pwmdac);
     disable_dac();
 
     dmaengine_pause(dchan);
@@ -1275,9 +1267,7 @@ static int do_dw_dac_sg_ib_test(void)
     //release trans_config
     release_trans_config(&trans_config,dchan->device->dev);
 trans_config_exit:
-    status = dmaengine_tx_status(dchan,cookie_tx, &state);
-    if (status == DMA_PAUSED)
-		dmaengine_terminate_async(dchan);
+
     dma_release_channel(dchan);
 chan_exit:
     return ret;
@@ -1296,8 +1286,7 @@ static int do_dw_dac_sg_oob_test(void)
     struct dma_async_tx_descriptor *tx;
     size_t xfer_len = 4096;
     dma_cookie_t cookie_tx;
-    struct dma_tx_state state;
-	enum dma_status status;
+
     //get channel 
     dma_cap_zero(mask);
     dma_cap_set(DMA_SLAVE, mask);
@@ -1310,6 +1299,7 @@ static int do_dw_dac_sg_oob_test(void)
         if(dchan && dchan->device && dchan->device->dev)
             pr_info("Got dw m2d channel success: %s\n", dma_chan_name(dchan));            
     }
+
     //allocate dma reachable buffer
     if(!allocate_trans_config(&trans_config,dchan->device->dev)) {
         ret = 1;
@@ -1329,7 +1319,7 @@ static int do_dw_dac_sg_oob_test(void)
     params.submit_index = 0;
     params.cnt          = 0;
     params.target_cnt   = 1;
-    pr_info("target_cnt:%d\n",params.target_cnt);
+
     //mocking jh7110_pwmdac_hw_params
     enable_dac();
     mocking_jh7110_pwmdac_hw_params(pwmdac);
@@ -1357,20 +1347,20 @@ static int do_dw_dac_sg_oob_test(void)
     pr_info("TX cookie=%u\n", cookie_tx);
 
     //trigger the tranfer by pulse_oob
-    dma_async_issue_pending(dchan);//oob desc will be filted here
+    dma_async_issue_pending(dchan);
     dma_pulse_oob(dchan);//real trigger
 
     jh7110_pwmdac_set(pwmdac);
     dump_pwmdac_regs(pwmdac->base);
+
     if (!wait_for_completion_timeout(&params.done, msecs_to_jiffies(10000))) {
         pr_err("tx DMA timeout error!\n");
-        jh7110_pwmdac_stop(pwmdac);
         dump_pwmdac_regs(pwmdac->base);
-        pr_info("pl dma channels terminated\n");
     } else {
-        jh7110_pwmdac_stop(pwmdac);
+        
         pr_info("wait success\n");
     }
+    jh7110_pwmdac_stop(pwmdac);
     disable_dac();
 
     dmaengine_pause(dchan);
@@ -1379,9 +1369,7 @@ static int do_dw_dac_sg_oob_test(void)
     //release trans_config
     release_trans_config(&trans_config,dchan->device->dev);
 trans_config_exit:
-    status = dmaengine_tx_status(dchan,cookie_tx, &state);
-    if (status == DMA_PAUSED)
-		dmaengine_terminate_async(dchan);
+
     dma_release_channel(dchan);
 chan_exit:
     return ret;
@@ -1391,14 +1379,14 @@ static int do_dw_dac_sg_mix_test(void)
 {
     int ret = 0;
     struct transfer_config trans_config;
-    struct scatterlist sg_tx[1];
-    struct my_cb_param params[MIX_TEST_DESC_LEN];
-    bool   oob_desc_sel[MIX_TEST_DESC_LEN] = {false,false,true,true};
-    bool   wait_success                    = true;
+    struct scatterlist     sg_tx[1];
+    struct my_cb_param     params[MIX_TEST_DESC_LEN];
+    bool                   oob_desc_sel[MIX_TEST_DESC_LEN] = {false,false,true,true};
+    bool                   wait_success                    = true;
 
     dma_cap_mask_t mask;
-    struct dma_chan *dchan;
-    struct dma_slave_config chan_tx_config = {0};
+    struct         dma_chan *dchan;
+    struct          dma_slave_config chan_tx_config = {0};
 
     struct dma_async_tx_descriptor *tx[MIX_TEST_DESC_LEN];
     size_t xfer_len = 4096;
@@ -1416,12 +1404,14 @@ static int do_dw_dac_sg_mix_test(void)
         if(dchan && dchan->device && dchan->device->dev)
             pr_info("Got dw m2d channel success: %s\n", dma_chan_name(dchan));            
     }
+
     //allocate dma reachable buffer
     if(!allocate_trans_config(&trans_config,dchan->device->dev)) {
         ret = 1;
         goto trans_config_exit;
     }
     fill_source_buffer(&trans_config);
+
     //init scatter list
     sg_init_table(sg_tx, 1);
     sg_init_one(&sg_tx[0], trans_config.buf_src, xfer_len);        
@@ -1434,9 +1424,9 @@ static int do_dw_dac_sg_mix_test(void)
     {
         init_completion(&(params[i].done));
         if(oob_desc_sel[i])
-            params[i].log        = "DAC:oob m2d dma by dw-axi-dmac cb is called";
+            params[i].log       = "DAC:oob m2d dma by dw-axi-dmac cb is called";
         else 
-            params[i].log        = "DAC:ib m2d dma by dw-axi-dmac cb is called";
+            params[i].log       = "DAC:ib m2d dma by dw-axi-dmac cb is called";
         params[i].submit_index = i;
         params[i].cnt          = 0;
         params[i].target_cnt   = 1;
@@ -1486,6 +1476,7 @@ static int do_dw_dac_sg_mix_test(void)
 
     jh7110_pwmdac_set(pwmdac);
     dump_pwmdac_regs(pwmdac->base);
+    //wait for all completion
     for(int i = 0;i<MIX_TEST_DESC_LEN;i++) 
     {
         if(!wait_for_completion_timeout(&(params[i].done),msecs_to_jiffies(10000)))
@@ -1589,52 +1580,6 @@ static const struct file_operations user_dma_fops = {
     .unlocked_ioctl = user_dma_ioctl,
 };
 
-// static bool prep_dma_chans(void) 
-// {
-    
-//     dma_cap_zero(mask);
-//     dma_cap_set(DMA_SLAVE, mask);
-//     // dw_dma_chan_dev= dma_request_channel(mask, my_dma_filter, DW_AXI_DMAC_NAME);
-//     dw_dma_chan_dev = dma_request_chan(&pdev_dac->dev, "tx");
-//     //PL08 dmac channels
-//     dma_cap_zero(mask);
-//     dma_cap_set(DMA_SLAVE, mask);
-//     pl_dma_chan_tx = dma_request_channel(mask, my_dma_filter, PL08_DMAC_NAME);
-//     pl_dma_chan_rx = dma_request_channel(mask, my_dma_filter, PL08_DMAC_NAME);
-    
-//     pr_info("end to request for dma channel\n");
-//     //check
-//     if (IS_ERR(dw_dma_chan_tx) || IS_ERR(dw_dma_chan_dev)) {
-//         pr_err("Failed to request DMA channel\n");
-//         return false;
-//     } else {
-//         if(dw_dma_chan_tx && dw_dma_chan_dev && dw_dma_chan_tx->device && dw_dma_chan_tx->device->dev)
-//             pr_info("Got dw tx channel: %s\n", dma_chan_name(dw_dma_chan_tx));
-//             pr_info("Got dw mem2dev channel: %s\n", dma_chan_name(dw_dma_chan_dev));
-//     }
-//     if(IS_ERR(pl_dma_chan_tx) || IS_ERR(pl_dma_chan_rx)) {
-//         pr_err("Failed to request PL08 DMA channel\n");
-//         return false;
-//     } else {
-//         if(pl_dma_chan_tx && pl_dma_chan_rx && pl_dma_chan_tx->device && pl_dma_chan_tx->device->dev) {
-//             pr_info("Got PL08 tx channel: %s\n", dma_chan_name(pl_dma_chan_tx));
-//             pr_info("Got PL08 rx channel: %s\n", dma_chan_name(pl_dma_chan_rx));
-//         }
-//     }
-//     return true;
-// }
-
-// static void release_dma_chans(void)
-// {
-//     //release dma buffer
-//     dma_free_coherent(dw_dma_chan_tx->device->dev, BUF_LEN, trans_config.buf_src, trans_config.dma_buf_src);
-//     dma_free_coherent(dw_dma_chan_tx->device->dev, BUF_LEN, trans_config.buf_des, trans_config.dma_buf_des);
-
-//     dma_release_channel(dw_dma_chan_tx);
-//     dma_release_channel(dw_dma_chan_dev);
-//     return;
-// }
-
 static int __init user_dma_init(void)
 {
     int ret;
@@ -1670,7 +1615,6 @@ static int __init user_dma_init(void)
 
 static void __exit user_dma_exit(void)
 {
-    // release_dma_chans();
 
     device_destroy(user_dma_class, dev_num);
     class_destroy(user_dma_class);

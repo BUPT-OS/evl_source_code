@@ -52,7 +52,7 @@ struct platform_device {
 extern int platform_device_register(struct platform_device *);
 extern void platform_device_unregister(struct platform_device *);
 
-extern struct bus_type platform_bus_type;
+extern const struct bus_type platform_bus_type;
 extern struct device platform_bus;
 
 extern struct resource *platform_get_resource(struct platform_device *,
@@ -63,6 +63,8 @@ extern struct resource *platform_get_mem_or_io(struct platform_device *,
 extern struct device *
 platform_find_device_by_driver(struct device *start,
 			       const struct device_driver *drv);
+
+#ifdef CONFIG_HAS_IOMEM
 extern void __iomem *
 devm_platform_get_and_ioremap_resource(struct platform_device *pdev,
 				unsigned int index, struct resource **res);
@@ -72,6 +74,32 @@ devm_platform_ioremap_resource(struct platform_device *pdev,
 extern void __iomem *
 devm_platform_ioremap_resource_byname(struct platform_device *pdev,
 				      const char *name);
+#else
+
+static inline void __iomem *
+devm_platform_get_and_ioremap_resource(struct platform_device *pdev,
+				unsigned int index, struct resource **res)
+{
+	return ERR_PTR(-EINVAL);
+}
+
+
+static inline void __iomem *
+devm_platform_ioremap_resource(struct platform_device *pdev,
+			       unsigned int index)
+{
+	return ERR_PTR(-EINVAL);
+}
+
+static inline void __iomem *
+devm_platform_ioremap_resource_byname(struct platform_device *pdev,
+				      const char *name)
+{
+	return ERR_PTR(-EINVAL);
+}
+
+#endif
+
 extern int platform_get_irq(struct platform_device *, unsigned int);
 extern int platform_get_irq_optional(struct platform_device *, unsigned int);
 extern int platform_irq_count(struct platform_device *);
@@ -207,7 +235,17 @@ extern void platform_device_put(struct platform_device *pdev);
 
 struct platform_driver {
 	int (*probe)(struct platform_device *);
-	int (*remove)(struct platform_device *);
+
+	/*
+	 * .remove_new() is a relic from a prototype conversion of .remove().
+	 * New drivers are supposed to implement .remove(). Once all drivers are
+	 * converted to not use .remove_new any more, it will be dropped.
+	 */
+	union {
+		void (*remove)(struct platform_device *);
+		void (*remove_new)(struct platform_device *);
+	};
+
 	void (*shutdown)(struct platform_device *);
 	int (*suspend)(struct platform_device *, pm_message_t state);
 	int (*resume)(struct platform_device *);

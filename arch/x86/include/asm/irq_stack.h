@@ -100,7 +100,7 @@
 }
 
 #define ASM_CALL_ARG0							\
-	"call %P[__func]				\n"		\
+	"call %c[__func]				\n"		\
 	ASM_REACHABLE
 
 #define ASM_CALL_ARG1							\
@@ -116,7 +116,7 @@
 	ASM_CALL_ARG2
 
 #define call_on_irqstack(func, asm_call, argconstr...)			\
-	call_on_stack(__this_cpu_read(hardirq_stack_ptr),		\
+	call_on_stack(__this_cpu_read(pcpu_hot.hardirq_stack_ptr),	\
 		      func, asm_call, argconstr)
 
 /* Macros to assert type correctness for run_*_on_irqstack macros */
@@ -140,7 +140,7 @@
 	 * in this case.						\
 	 */								\
 	if ((!irqs_pipelined() && user_mode(regs)) ||			\
-		__this_cpu_read(hardirq_stack_inuse)) {			\
+		__this_cpu_read(pcpu_hot.hardirq_stack_inuse)) {	\
 		irq_enter_rcu();					\
 		func(c_args);						\
 		irq_exit_rcu();						\
@@ -156,9 +156,9 @@
 		 * run directly over the preempted context, therefore   \
 		 * they never land there.				\
 		 */							\
-		__this_cpu_write(hardirq_stack_inuse, true);		\
+		__this_cpu_write(pcpu_hot.hardirq_stack_inuse, true);	\
 		call_on_irqstack(func, asm_call, constr);		\
-		__this_cpu_write(hardirq_stack_inuse, false);		\
+		__this_cpu_write(pcpu_hot.hardirq_stack_inuse, false);	\
 	}								\
 }
 
@@ -222,9 +222,9 @@
  */
 #define do_softirq_own_stack()						\
 {									\
-	__this_cpu_write(hardirq_stack_inuse, true);			\
+	__this_cpu_write(pcpu_hot.hardirq_stack_inuse, true);		\
 	call_on_irqstack(__do_softirq, ASM_CALL_ARG0);			\
-	__this_cpu_write(hardirq_stack_inuse, false);			\
+	__this_cpu_write(pcpu_hot.hardirq_stack_inuse, false);		\
 }
 
 #else  /* needed by CONFIG_IRQ_PIPELINE */

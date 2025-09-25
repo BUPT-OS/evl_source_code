@@ -19,17 +19,18 @@
 #include <evl/wait.h>
 #include <evl/poll.h>
 #include <evl/sched.h>
+#include <evl/uio.h>
 #include <evl/net/socket.h>
 #include <evl/net/packet.h>
 #include <evl/net/input.h>
 #include <evl/net/output.h>
 #include <evl/net/device.h>
 #include <evl/net/skb.h>
+#include <evl/net/timestamping.h>
 #include <evl/uaccess.h>
 
 static struct evl_net_proto *
-find_packet_proto(__be16 protocol,
-		struct evl_net_proto *default_proto);
+find_packet_proto(int protocol, struct evl_net_proto *default_proto);
 
 /*
  * Lock nesting: protocol_lock -> rxq->lock -> esk->input_wait.wchan.lock
@@ -48,7 +49,7 @@ static DEFINE_EVL_SPINLOCK(protocol_lock);
 
 /* oob, hard irqs off */
 static bool __packet_deliver(struct evl_net_rxqueue *rxq,
-			struct sk_buff *skb, __be16 protocol)
+			struct sk_buff *skb, int protocol)
 {
 	struct net_device *dev = skb->dev;
 	bool delivered = false;
@@ -75,12 +76,12 @@ static bool __packet_deliver(struct evl_net_rxqueue *rxq,
 		 * a newly registered device reusing an old ifindex we
 		 * initially captured at binding time.
 		 */
-		ifindex = READ_ONCE(esk->binding.real_ifindex);
+		ifindex = READ_ONCE(esk->u.packet.real_ifindex);
 		if (ifindex) {
 			if (ifindex != dev->ifindex)
 				continue;
-			vlan_id = READ_ONCE(esk->binding.vlan_id);
-			if (skb_vlan_tag_get_id(skb) != vlan_id)
+			vlan_id = READ_ONCE(esk->u.packet.vlan_id);
+			if (vlan_id && skb_vlan_tag_get_id(skb) != vlan_id)
 				continue;
 		}
 
@@ -90,7 +91,7 @@ static bool __packet_deliver(struct evl_net_rxqueue *rxq,
 		 * not consume more memory, skip delivery and try with
 		 * the next subscriber.
 		 */
-		if (!evl_charge_socket_rmem(esk, skb))
+		if (!evl_net_charge_skb_rmem(esk, skb))
 			continue;
 
 		/*
@@ -100,11 +101,11 @@ static bool __packet_deliver(struct evl_net_rxqueue *rxq,
 		 * consumes the incoming buffer.
 		 */
 		qskb = skb;
-		if (protocol == htons(ETH_P_ALL)) {
+		if (protocol == ETH_P_ALL) {
 			qskb = evl_net_clone_skb(skb);
 			if (qskb == NULL) {
 				evl_flush_wait(&esk->input_wait, EVL_T_NOMEM);
-				evl_uncharge_socket_rmem(esk, skb);
+				evl_net_uncharge_skb_rmem(skb);
 				break;
 			}
 		}
@@ -119,7 +120,7 @@ static bool __packet_deliver(struct evl_net_rxqueue *rxq,
 
 		evl_signal_poll_events(&esk->poll_head,	POLLIN|POLLRDNORM);
 		delivered = true;
-		if (protocol != htons(ETH_P_ALL))
+		if (protocol != ETH_P_ALL)
 			break;
 	}
 
@@ -140,14 +141,14 @@ static struct evl_net_rxqueue *find_rxqueue(u32 hkey)
 	return NULL;
 }
 
-static inline u32 get_protocol_hash(__be16 protocol)
+static inline u32 get_protocol_hash(int protocol)
 {
 	u32 hsrc = protocol;
 
 	return jhash2(&hsrc, 1, 0);
 }
 
-static bool packet_deliver(struct sk_buff *skb, __be16 protocol) /* oob */
+static bool packet_deliver(struct sk_buff *skb, int protocol) /* oob */
 {
 	struct evl_net_rxqueue *rxq;
 	unsigned long flags;
@@ -155,7 +156,6 @@ static bool packet_deliver(struct sk_buff *skb, __be16 protocol) /* oob */
 	u32 hkey;
 
 	hkey = get_protocol_hash(protocol);
-
 	/*
 	 * Find the rx queue linking sockets attached to the protocol.
 	 */
@@ -187,14 +187,17 @@ static bool packet_deliver(struct sk_buff *skb, __be16 protocol) /* oob */
  */
 bool evl_net_packet_deliver(struct sk_buff *skb) /* oob */
 {
-	packet_deliver(skb, htons(ETH_P_ALL));
+	if (skb_is_oob_timestamped(skb))
+		skb_shinfo_oob(skb)->delivery_time = evl_ktime_monotonic();
 
-	return packet_deliver(skb, skb->protocol);
+	packet_deliver(skb, ETH_P_ALL);
+
+	return packet_deliver(skb, ntohs(skb->protocol));
 }
 
 /* in-band. */
 static int attach_packet_socket(struct evl_socket *esk,
-				struct evl_net_proto *proto, __be16 protocol)
+				struct evl_net_proto *proto, int protocol)
 {
 	struct evl_net_rxqueue *rxq, *_rxq;
 	unsigned long flags;
@@ -219,7 +222,7 @@ static int attach_packet_socket(struct evl_socket *esk,
 	evl_spin_lock_irqsave(&protocol_lock, flags);
 
 	esk->proto = proto;
-	esk->binding.proto_hash = hkey;
+	esk->u.packet.proto_hash = hkey;
 	esk->protocol = protocol;
 
 	_rxq = find_rxqueue(hkey);
@@ -240,8 +243,8 @@ static int attach_packet_socket(struct evl_socket *esk,
 	return 0;
 }
 
-/* in-band, esk->lock held or socket_release() */
-static void detach_packet_socket(struct evl_socket *esk)
+/* in-band, esk->lock held or __sk_destruct() */
+static void destroy_packet_socket(struct evl_socket *esk)
 {
 	struct evl_net_rxqueue *rxq, *n;
 	unsigned long flags;
@@ -252,7 +255,7 @@ static void detach_packet_socket(struct evl_socket *esk)
 
 	evl_spin_lock_irqsave(&protocol_lock, flags);
 
-	rxq = find_rxqueue(esk->binding.proto_hash);
+	rxq = find_rxqueue(esk->u.packet.proto_hash);
 
 	list_del_init(&esk->next_sub); /* Remove from rxq->subscribers */
 	if (list_empty(&rxq->subscribers)) {
@@ -285,7 +288,7 @@ static int bind_packet_socket(struct evl_socket *esk,
 	if (sll->sll_family != AF_PACKET)
 		return -EINVAL;
 
-	proto = find_packet_proto(sll->sll_protocol, esk->proto);
+	proto = find_packet_proto(ntohs(sll->sll_protocol), esk->proto);
 	if (proto == NULL)
 		return -EINVAL;
 
@@ -293,31 +296,29 @@ static int bind_packet_socket(struct evl_socket *esk,
 
 	mutex_lock(&esk->lock);
 
-	old_ifindex = esk->binding.vlan_ifindex;
+	old_ifindex = esk->u.packet.ifindex;
 	if (new_ifindex != old_ifindex) {
 		if (new_ifindex) {
-			/* @dev has to be a VLAN device. */
 			dev = evl_net_get_dev_by_index(esk->net, new_ifindex);
-			if (dev == NULL)
-				return -EINVAL;
-			vlan_id = vlan_dev_vlan_id(dev);
-			real_ifindex = vlan_dev_real_dev(dev)->ifindex;
+			if (dev == NULL) {
+				ret = -EINVAL;
+				goto out;
+			}
+			if (is_vlan_dev(dev)) {
+				vlan_id = vlan_dev_vlan_id(dev);
+				real_ifindex = vlan_dev_real_dev(dev)->ifindex;
+			} else {
+				vlan_id = 0;
+				real_ifindex = dev->ifindex;
+			}
 		} else {
 			vlan_id = 0;
 			real_ifindex = 0;
 		}
 	}
 
-	/*
-	 * We precede the regular AF_PACKET bind handler which makes
-	 * no sense of bindings to VLAN devices unlike we do. Fix up
-	 * the address accordingly, pointing at the real device
-	 * instead.
-	 */
-	sll->sll_ifindex = real_ifindex;
-
-	if (esk->protocol != sll->sll_protocol) {
-		detach_packet_socket(esk);
+	if (esk->protocol != ntohs(sll->sll_protocol)) {
+		destroy_packet_socket(esk);
 		/*
 		 * Since the old binding was dropped, we would not
 		 * receive anything if the new binding fails. This
@@ -325,7 +326,7 @@ static int bind_packet_socket(struct evl_socket *esk,
 		 * root issue would be way more problematic than a
 		 * dead socket.
 		 */
-		ret = attach_packet_socket(esk, proto, sll->sll_protocol);
+		ret = attach_packet_socket(esk, proto, ntohs(sll->sll_protocol));
 		if (ret)
 			goto out;
 	}
@@ -340,9 +341,9 @@ static int bind_packet_socket(struct evl_socket *esk,
 	raw_spin_lock_irqsave(&esk->oob_lock, flags);
 	if (new_ifindex != old_ifindex) {
 		/* First change the real interface, next the vid. */
-		WRITE_ONCE(esk->binding.real_ifindex, real_ifindex);
-		esk->binding.vlan_id = vlan_id;
-		WRITE_ONCE(esk->binding.vlan_ifindex, new_ifindex);
+		WRITE_ONCE(esk->u.packet.real_ifindex, real_ifindex);
+		esk->u.packet.vlan_id = vlan_id;
+		WRITE_ONCE(esk->u.packet.ifindex, new_ifindex);
 	}
 	raw_spin_unlock_irqrestore(&esk->oob_lock, flags);
 
@@ -358,7 +359,7 @@ static int bind_packet_socket(struct evl_socket *esk,
 static struct net_device *get_netif_packet(struct evl_socket *esk)
 {
 	return  evl_net_get_dev_by_index(esk->net,
-					esk->binding.vlan_ifindex);
+					esk->u.packet.ifindex);
 }
 
 static struct net_device *find_xmit_device(struct evl_socket *esk,
@@ -370,33 +371,37 @@ static struct net_device *find_xmit_device(struct evl_socket *esk,
 	struct net_device *dev;
 	int ret;
 
-	ret = raw_get_user(name_ptr, &u_msghdr->name_ptr);
-	if (ret)
-		return ERR_PTR(-EFAULT);
-
-	ret = raw_get_user(namelen, &u_msghdr->namelen);
-	if (ret)
-		return ERR_PTR(-EFAULT);
-
-	if (!name_ptr) {
-		if (namelen)
-			return ERR_PTR(-EINVAL);
-
-		dev = esk->proto->get_netif(esk);
-	} else {
-		if (namelen < sizeof(addr))
-			return ERR_PTR(-EINVAL);
-
-		u_addr = evl_valptr64(name_ptr, struct sockaddr_ll);
-		ret = raw_copy_from_user(&addr, u_addr, sizeof(addr));
+	if (u_msghdr) {
+		ret = raw_get_user(name_ptr, &u_msghdr->name_ptr);
 		if (ret)
 			return ERR_PTR(-EFAULT);
 
-		if (addr.sll_family != AF_PACKET &&
-			addr.sll_family != AF_UNSPEC)
-			return ERR_PTR(-EINVAL);
+		ret = raw_get_user(namelen, &u_msghdr->namelen);
+		if (ret)
+			return ERR_PTR(-EFAULT);
 
-		dev = evl_net_get_dev_by_index(esk->net, addr.sll_ifindex);
+		if (!name_ptr) {
+			if (namelen)
+				return ERR_PTR(-EINVAL);
+
+			dev = esk->proto->get_netif(esk);
+		} else {
+			if (namelen < sizeof(addr))
+				return ERR_PTR(-EINVAL);
+
+			u_addr = evl_valptr64(name_ptr, struct sockaddr_ll);
+			ret = raw_copy_from_user(&addr, u_addr, sizeof(addr));
+			if (ret)
+				return ERR_PTR(-EFAULT);
+
+			if (addr.sll_family != AF_PACKET &&
+				addr.sll_family != AF_UNSPEC)
+				return ERR_PTR(-EINVAL);
+
+			dev = evl_net_get_dev_by_index(esk->net, addr.sll_ifindex);
+		}
+	} else {
+		dev = esk->proto->get_netif(esk);
 	}
 
 	if (dev == NULL)
@@ -407,67 +412,73 @@ static struct net_device *find_xmit_device(struct evl_socket *esk,
 
 /* oob */
 static ssize_t send_packet(struct evl_socket *esk,
-			const struct user_oob_msghdr __user *u_msghdr,
-			const struct iovec *iov,
+			const struct user_oob_msghdr __user *u_msghdr, /* oob_write() if NULL */
+			struct iovec *iov,
 			size_t iovlen)
 {
 	struct net_device *dev, *real_dev;
+	ktime_t timeout = EVL_INFINITE;
+	enum evl_tmode tmode = EVL_REL;
 	struct __evl_timespec uts;
-	enum evl_tmode tmode;
 	struct sk_buff *skb;
 	__u32 msg_flags = 0;
 	ssize_t ret, count;
-	ktime_t timeout;
 	size_t rem;
 
-	ret = raw_get_user(msg_flags, &u_msghdr->flags);
-	if (ret)
-		return -EFAULT;
+	if (u_msghdr) {
+		ret = raw_get_user(msg_flags, &u_msghdr->flags);
+		if (ret)
+			return -EFAULT;
 
-	if (msg_flags & ~MSG_DONTWAIT)
-		return -EINVAL;
+		if (msg_flags & ~MSG_DONTWAIT)
+			return -EINVAL;
 
-	if (evl_socket_f_flags(esk) & O_NONBLOCK)
-		msg_flags |= MSG_DONTWAIT;
+		if (evl_socket_f_flags(esk) & O_NONBLOCK)
+			msg_flags |= MSG_DONTWAIT;
 
-	/*
-	 * Fetch the timeout on obtaining a buffer from
-	 * est->free_skb_pool.
-	 */
-	ret = raw_copy_from_user(&uts, &u_msghdr->timeout, sizeof(uts));
-	if (ret)
-		return -EFAULT;
+		/* Fetch the timeout on obtaining a buffer from the TX pool. */
+		ret = raw_copy_from_user(&uts, &u_msghdr->timeout, sizeof(uts));
+		if (ret)
+			return -EFAULT;
 
-	timeout = msg_flags & MSG_DONTWAIT ? EVL_NONBLOCK :
-		u_timespec_to_ktime(uts);
-	tmode = timeout ? EVL_ABS : EVL_REL;
+		timeout = msg_flags & MSG_DONTWAIT ? EVL_NONBLOCK :
+			u_timespec_to_ktime(uts);
+		if (timeout)
+			tmode = EVL_ABS;
+	}
 
-	/* Determine the xmit interface (always a VLAN device). */
+	/* Determine the xmit interface. */
 	dev = find_xmit_device(esk, u_msghdr);
 	if (IS_ERR(dev))
 		return PTR_ERR(dev);
 
 	/*
-	 * Since @dev is a VLAN device, then @real_dev cannot be stale
+	 * If @dev is a VLAN device, then @real_dev cannot be stale
 	 * until @dev goes down per the in-band refcounting
-	 * guarantee. Since we hold a crossing reference on @dev, it
-	 * cannot go down as it would need to pass the crossing first,
-	 * so @real_dev cannot go stale until we are done.
+	 * guarantee. Since we hold a crossing reference on @real_dev,
+	 * it cannot go down as it would need to pass the crossing
+	 * first, so @real_dev cannot go stale until we are done.
 	 */
-	real_dev = vlan_dev_real_dev(dev);
+	real_dev = evl_net_real_dev(dev);
+
 	skb = evl_net_dev_alloc_skb(real_dev, timeout, tmode);
 	if (IS_ERR(skb)) {
 		ret = PTR_ERR(skb);
 		goto out;
 	}
 
-	skb_reset_mac_header(skb);
-	skb->protocol = esk->protocol;
-	skb->dev = real_dev;
-	skb->priority = esk->sk->sk_priority;
+	if (READ_ONCE(esk->timestamping) & EVL_SOF_TIMESTAMP_TX) {
+		skb_shinfo_oob(skb)->delivery_time = evl_ktime_monotonic();
+		skb_mark_oob_timestamped(skb);
+	}
 
-	count = evl_import_iov(iov, iovlen, skb->data, skb_tailroom(skb), &rem);
-	if (rem || count > dev->mtu + dev->hard_header_len + VLAN_HLEN)
+	skb_reset_mac_header(skb);
+	skb->protocol = htons(esk->protocol);
+	skb->dev = real_dev;
+	skb->priority = READ_ONCE(esk->sk->sk_priority);
+
+	count = evl_copy_from_uio(iov, iovlen, skb->data, skb_tailroom(skb), &rem);
+	if (rem || count + dev->hard_header_len + VLAN_HLEN > READ_ONCE(dev->mtu))
 		ret = -EMSGSIZE;
 	else if (!dev_validate_header(dev, skb->data, count))
 		ret = -EINVAL;
@@ -489,13 +500,13 @@ static ssize_t send_packet(struct evl_socket *esk,
 	 * output contention to end, or the caller asked for a
 	 * non-blocking operation while such contention was ongoing.
 	 */
-	ret = evl_charge_socket_wmem(esk, skb, timeout, tmode);
+	ret = evl_net_charge_skb_wmem(esk, skb, timeout, tmode);
 	if (ret)
 		goto cleanup;
 
-	ret = evl_net_ether_transmit(dev, skb);
+	ret = evl_net_ether_transmit_raw(dev, skb);
 	if (ret) {
-		evl_uncharge_socket_wmem(skb);
+		evl_net_uncharge_skb_wmem(skb);
 		goto cleanup;
 	}
 
@@ -509,98 +520,105 @@ cleanup:
 	goto out;
 }
 
-static ssize_t copy_packet_to_user(struct user_oob_msghdr __user *u_msghdr,
+static ssize_t copy_packet_to_user(struct user_oob_msghdr __user *u_msghdr, /* oob_read() if NULL */
 				const struct iovec *iov,
 				size_t iovlen,
-				struct sk_buff *skb)
+				struct sk_buff *skb,
+				__u32 msg_uflags)
 {
 	struct sockaddr_ll addr, __user *u_addr;
 	__u64 name_ptr, namelen;
-	__u32 msg_flags = 0;
 	ssize_t ret, count;
 
-	ret = raw_get_user(name_ptr, &u_msghdr->name_ptr);
-	if (ret)
-		return -EFAULT;
+	if (u_msghdr) {
+		ret = raw_get_user(name_ptr, &u_msghdr->name_ptr);
+		if (ret)
+			return -EFAULT;
 
-	ret = raw_get_user(namelen, &u_msghdr->namelen);
-	if (ret)
-		return -EFAULT;
+		ret = raw_get_user(namelen, &u_msghdr->namelen);
+		if (ret)
+			return -EFAULT;
 
-	if (!name_ptr) {
-		if (namelen)
-			return -EINVAL;
-		goto copy_data;
+		if (name_ptr) {
+			if (namelen != sizeof(addr)) {
+				if (namelen < sizeof(addr))
+					return -EINVAL;
+				ret = raw_put_user(sizeof(addr), &u_msghdr->namelen);
+				if (ret)
+					return -EFAULT;
+			}
+			addr.sll_family = AF_PACKET;
+			addr.sll_protocol = skb->protocol;
+			addr.sll_ifindex = skb->dev->ifindex;
+			addr.sll_hatype = skb->dev->type;
+			addr.sll_pkttype = skb->pkt_type;
+			addr.sll_halen = dev_parse_header(skb, addr.sll_addr);
+			u_addr = evl_valptr64(name_ptr, struct sockaddr_ll);
+			ret = raw_copy_to_user(u_addr, &addr, sizeof(addr));
+			if (ret)
+				return -EFAULT;
+		} else {
+			if (namelen)
+				return -EINVAL;
+		}
 	}
 
-	if (namelen < sizeof(addr))
-		return -EINVAL;
+	count = evl_copy_to_uio(iov, iovlen, skb->data, skb->len);
 
-	addr.sll_family = AF_PACKET;
-	addr.sll_protocol = skb->protocol;
-	addr.sll_ifindex = skb->dev->ifindex;
-	addr.sll_hatype = skb->dev->type;
-	addr.sll_pkttype = skb->pkt_type;
-	addr.sll_halen = dev_parse_header(skb, addr.sll_addr);
-
-	u_addr = evl_valptr64(name_ptr, struct sockaddr_ll);
-	ret = raw_copy_to_user(u_addr, &addr, sizeof(addr));
-	if (ret)
-		return -EFAULT;
-
-copy_data:
-	count = evl_export_iov(iov, iovlen, skb->data, skb->len);
-	if (count < skb->len)
-		msg_flags |= MSG_TRUNC;
-
-	ret = raw_put_user(msg_flags, &u_msghdr->flags);
-	if (ret)
-		return -EFAULT;
+	if (u_msghdr && count < skb->len) {
+		ret = raw_put_user(msg_uflags | MSG_TRUNC, &u_msghdr->flags);
+		if (ret)
+			return -EFAULT;
+	}
 
 	return count;
 }
 
 /* oob */
 static ssize_t receive_packet(struct evl_socket *esk,
-			struct user_oob_msghdr __user *u_msghdr,
-			const struct iovec *iov,
+			struct user_oob_msghdr __user *u_msghdr, /* oob_read() if NULL */
+			struct iovec *iov,
 			size_t iovlen)
 {
+	__u32 msg_flags = 0, msg_uflags = 0;
+	ktime_t timeout = EVL_INFINITE;
+	enum evl_tmode tmode = EVL_REL;
 	struct __evl_timespec uts;
-	enum evl_tmode tmode;
 	struct sk_buff *skb;
 	unsigned long flags;
-	__u32 msg_flags = 0;
-	ktime_t timeout;
 	ssize_t ret;
 
+	if (evl_socket_f_flags(esk) & O_NONBLOCK)
+		msg_flags |= MSG_DONTWAIT;
+
 	if (u_msghdr) {
-		ret = raw_get_user(msg_flags, &u_msghdr->flags);
+		ret = raw_get_user(msg_uflags, &u_msghdr->flags);
 		if (ret)
 			return -EFAULT;
 
+		msg_flags |= msg_uflags;
+
 		/* No MSG_TRUNC on recv, too much of a kludge. */
-		if (msg_flags & ~MSG_DONTWAIT)
+		if (msg_flags & ~(MSG_DONTWAIT|MSG_TIMESTAMP))
 			return -EINVAL;
 
-		/*
-		 * Fetch the timeout on receiving a buffer from
-		 * esk->input.
-		 */
 		ret = raw_copy_from_user(&uts, &u_msghdr->timeout,
 					sizeof(uts));
 		if (ret)
 			return -EFAULT;
 
-		timeout = u_timespec_to_ktime(uts);
-		tmode = timeout ? EVL_ABS : EVL_REL;
-	} else {
-		timeout = EVL_INFINITE;
-		tmode = EVL_REL;
-	}
+		if (msg_flags & MSG_DONTWAIT) {
+			timeout = EVL_NONBLOCK;
+		} else {
+			timeout = u_timespec_to_ktime(uts);
+			if (timeout)
+				tmode = EVL_ABS;
+		}
 
-	if (evl_socket_f_flags(esk) & O_NONBLOCK)
-		msg_flags |= MSG_DONTWAIT;
+		if (msg_flags & MSG_TIMESTAMP)
+			return evl_collect_socket_iots(esk, u_msghdr, msg_uflags,
+						iov, iovlen, timeout, tmode);
+	}
 
 	do {
 		raw_spin_lock_irqsave(&esk->input_wait.wchan.lock, flags);
@@ -608,10 +626,16 @@ static ssize_t receive_packet(struct evl_socket *esk,
 		if (!list_empty(&esk->input)) {
 			skb = list_get_entry(&esk->input, struct sk_buff, list);
 			raw_spin_unlock_irqrestore(&esk->input_wait.wchan.lock, flags);
-			/* Restore the MAC header. */
-			skb_push(skb, skb->data - skb_mac_header(skb));
-			ret = copy_packet_to_user(u_msghdr, iov, iovlen, skb);
-			evl_uncharge_socket_rmem(esk, skb);
+			/* Record the timestamps if required. */
+			ret = 0;
+			if (READ_ONCE(esk->timestamping) & EVL_SOF_TIMESTAMP_RX)
+				ret = evl_copy_iots_rx(skb, u_msghdr);
+			if (likely(!ret)) {
+				/* Restore the MAC header. */
+				skb_push(skb, skb->data - skb_mac_header(skb));
+				ret = copy_packet_to_user(u_msghdr, iov, iovlen, skb, msg_uflags);
+			}
+			evl_net_uncharge_skb_rmem(skb);
 			evl_net_free_skb(skb);
 			return ret;
 		}
@@ -637,21 +661,18 @@ static __poll_t poll_packet(struct evl_socket *esk,
 	struct net_device *dev;
 	__poll_t ret = 0;
 
-	/*
-	 * Enqueue, then test. No big deal if we race on list_empty(),
-	 * at worst this would lead to a spurious wake up, which the
-	 * caller would detect under lock then go back waiting.
-	 */
+	/* Enqueue, then test. */
 	evl_poll_watch(&esk->poll_head, wait, NULL);
-	if (!list_empty(&esk->input))
+	/* Check whether we have datagrams and/or timestamps to read. */
+	if (!list_empty(&esk->input) || evl_test_socket_iots(esk))
 		ret = POLLIN|POLLRDNORM;
 
 	dev = esk->proto->get_netif(esk);
 	if (dev) {
-		est = dev->oob_context.dev_state.estate;
+		est = dev->oob_state.estate;
 		evl_poll_watch(&est->poll_head, wait, NULL);
-		if (!list_empty(&est->free_skb_pool))
-			ret = POLLOUT|POLLWRNORM;
+		/* FIXME: Assume we can always TX, which is too optimistic. */
+		ret |= POLLOUT|POLLWRNORM;
 		evl_net_put_dev(dev);
 	}
 
@@ -660,7 +681,7 @@ static __poll_t poll_packet(struct evl_socket *esk,
 
 static struct evl_net_proto ether_packet_proto = {
 	.attach	= attach_packet_socket,
-	.detach = detach_packet_socket,
+	.destroy = destroy_packet_socket,
 	.bind = bind_packet_socket,
 	.oob_send = send_packet,
 	.oob_poll = poll_packet,
@@ -669,12 +690,11 @@ static struct evl_net_proto ether_packet_proto = {
 };
 
 static struct evl_net_proto *
-find_packet_proto(__be16 protocol,
-		struct evl_net_proto *default_proto)
+find_packet_proto(int protocol,	struct evl_net_proto *default_proto)
 {
 	switch (protocol) {
-	case htons(ETH_P_ALL):
-	case htons(ETH_P_IP):
+	case ETH_P_ALL:
+	case ETH_P_IP:
 		return &ether_packet_proto;
 	case 0:
 		return default_proto;
@@ -683,8 +703,7 @@ find_packet_proto(__be16 protocol,
 	}
 }
 
-static struct evl_net_proto *
-match_packet_domain(int type, __be16 protocol)
+static struct evl_net_proto *match_packet_domain(int type, int protocol)
 {
 	static struct evl_net_proto *proto;
 

@@ -38,4 +38,16 @@ config GENERIC_CLOCKSOURCE_VDSO
 	   Enables access to clocksources via the vDSO based on
 	   generic MMIO operations.
 
+config GENERIC_VDSO_OVERFLOW_PROTECT
+	bool
+	help
+	  Select to add multiplication overflow protection to the VDSO
+	  time getter functions for the price of an extra conditional
+	  in the hotpath.
+
 endif
+
+config VDSO_GETRANDOM
+	bool
+	help
+	  Selected by architectures that support vDSO getrandom().

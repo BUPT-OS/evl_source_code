@@ -8,7 +8,8 @@
  */
 
 #include <linux/linkage.h>
-#include <linux/list.h>
+#include <linux/cleanup.h>
+#include <linux/types.h>
 
 /*
  * We put the hardirq and softirq counter into the preemption
@@ -108,14 +109,21 @@ static __always_inline unsigned char interrupt_context_level(void)
 	return level;
 }
 
+/*
+ * These macro definitions avoid redundant invocations of preempt_count()
+ * because such invocations would result in redundant loads given that
+ * preempt_count() is commonly implemented with READ_ONCE().
+ */
+
 #define nmi_count()	(preempt_count() & NMI_MASK)
 #define hardirq_count()	(preempt_count() & HARDIRQ_MASK)
 #ifdef CONFIG_PREEMPT_RT
 # define softirq_count()	(current->softirq_disable_cnt & SOFTIRQ_MASK)
+# define irq_count()		((preempt_count() & (NMI_MASK | HARDIRQ_MASK)) | softirq_count())
 #else
 # define softirq_count()	(preempt_count() & SOFTIRQ_MASK)
+# define irq_count()		(preempt_count() & (NMI_MASK | HARDIRQ_MASK | SOFTIRQ_MASK))
 #endif
-#define irq_count()	(nmi_count() | hardirq_count() | softirq_count())
 
 /* The current IRQ stage level: 0=inband, 1=oob */
 #define stage_level()	((preempt_count() & STAGE_MASK) >> STAGE_SHIFT)
@@ -131,7 +139,11 @@ static __always_inline unsigned char interrupt_context_level(void)
 #define in_nmi()		(nmi_count())
 #define in_hardirq()		(hardirq_count())
 #define in_serving_softirq()	(softirq_count() & SOFTIRQ_OFFSET)
-#define in_task()		(!(in_nmi() | in_hardirq() | in_serving_softirq()))
+#ifdef CONFIG_PREEMPT_RT
+# define in_task()		(!((preempt_count() & (NMI_MASK | HARDIRQ_MASK)) | in_serving_softirq()))
+#else
+# define in_task()		(!(preempt_count() & (NMI_MASK | HARDIRQ_MASK | SOFTIRQ_OFFSET)))
+#endif
 
 /*
  * The following macros are deprecated and should not be used in new code:
@@ -379,7 +391,9 @@ void preempt_notifier_unregister(struct preempt_notifier *notifier);
 static inline void preempt_notifier_init(struct preempt_notifier *notifier,
 				     struct preempt_ops *ops)
 {
-	INIT_HLIST_NODE(&notifier->link);
+	/* INIT_HLIST_NODE() open coded, to avoid dependency on list.h */
+	notifier->link.next = NULL;
+	notifier->link.pprev = NULL;
 	notifier->ops = ops;
 }
 
@@ -494,6 +508,10 @@ static __always_inline void preempt_enable_nested(void)
 		preempt_enable();
 }
 
+DEFINE_LOCK_GUARD_0(preempt, preempt_disable(), preempt_enable())
+DEFINE_LOCK_GUARD_0(preempt_notrace, preempt_disable_notrace(), preempt_enable_notrace())
+DEFINE_LOCK_GUARD_0(migrate, migrate_disable(), migrate_enable())
+
 #ifdef CONFIG_IRQ_PIPELINE
 
 static __always_inline bool running_inband(void)
@@ -508,6 +526,8 @@ static __always_inline bool running_oob(void)
 
 unsigned long hard_preempt_disable(void);
 void hard_preempt_enable(unsigned long flags);
+unsigned long hard_bh_disable(void);
+void hard_bh_enable(unsigned long flags);
 
 #else  /* !CONFIG_IRQ_PIPELINE */
 
@@ -526,11 +546,66 @@ static __always_inline bool running_oob(void)
 	preempt_disable();		\
 	0;				\
 })
+
 #define hard_preempt_enable(__flags)	\
 	do {				\
 		preempt_enable();	\
 		(void)(__flags);	\
 	} while (0)
+
+#define hard_bh_disable()		\
+({					\
+	local_bh_disable();		\
+	0;				\
+})
+
+#define hard_bh_enable(__flags)		\
+	do {				\
+		local_bh_enable();	\
+		(void)(__flags);	\
+	} while (0)
+
 #endif	/* !CONFIG_IRQ_PIPELINE */
+
+#ifdef CONFIG_PREEMPT_DYNAMIC
+
+extern bool preempt_model_none(void);
+extern bool preempt_model_voluntary(void);
+extern bool preempt_model_full(void);
+
+#else
+
+static inline bool preempt_model_none(void)
+{
+	return IS_ENABLED(CONFIG_PREEMPT_NONE);
+}
+static inline bool preempt_model_voluntary(void)
+{
+	return IS_ENABLED(CONFIG_PREEMPT_VOLUNTARY);
+}
+static inline bool preempt_model_full(void)
+{
+	return IS_ENABLED(CONFIG_PREEMPT);
+}
+
+#endif
+
+static inline bool preempt_model_rt(void)
+{
+	return IS_ENABLED(CONFIG_PREEMPT_RT);
+}
+
+/*
+ * Does the preemption model allow non-cooperative preemption?
+ *
+ * For !CONFIG_PREEMPT_DYNAMIC kernels this is an exact match with
+ * CONFIG_PREEMPTION; for CONFIG_PREEMPT_DYNAMIC this doesn't work as the
+ * kernel is *built* with CONFIG_PREEMPTION=y but may run with e.g. the
+ * PREEMPT_NONE model.
+ */
+static inline bool preempt_model_preemptible(void)
+{
+	return preempt_model_full() || preempt_model_rt();
+}
 
 #endif /* __LINUX_PREEMPT_H */

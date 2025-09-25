@@ -161,7 +161,7 @@ static const void __user *uverbs_request_next_ptr(struct uverbs_req_iter *iter,
 {
 	const void __user *res = iter->cur;
 
-	if (iter->cur + len > iter->end)
+	if (len > iter->end - iter->cur)
 		return (void __force __user *)ERR_PTR(-ENOSPC);
 	iter->cur += len;
 	return res;
@@ -572,7 +572,7 @@ static int ib_uverbs_open_xrcd(struct uverbs_attr_bundle *attrs)
 	struct inode                   *inode = NULL;
 	int				new_xrcd = 0;
 	struct ib_device *ib_dev;
-	struct fd f = {};
+	struct fd f = EMPTY_FD;
 	int ret;
 
 	ret = uverbs_request(attrs, &cmd, sizeof(cmd));
@@ -584,12 +584,12 @@ static int ib_uverbs_open_xrcd(struct uverbs_attr_bundle *attrs)
 	if (cmd.fd != -1) {
 		/* search for file descriptor */
 		f = fdget(cmd.fd);
-		if (!f.file) {
+		if (!fd_file(f)) {
 			ret = -EBADF;
 			goto err_tree_mutex_unlock;
 		}
 
-		inode = file_inode(f.file);
+		inode = file_inode(fd_file(f));
 		xrcd = find_xrcd(ibudev, inode);
 		if (!xrcd && !(cmd.oflags & O_CREAT)) {
 			/* no file descriptor. Need CREATE flag */
@@ -632,7 +632,7 @@ static int ib_uverbs_open_xrcd(struct uverbs_attr_bundle *attrs)
 		atomic_inc(&xrcd->usecnt);
 	}
 
-	if (f.file)
+	if (fd_file(f))
 		fdput(f);
 
 	mutex_unlock(&ibudev->xrcd_tree_mutex);
@@ -648,7 +648,7 @@ err:
 	uobj_alloc_abort(&obj->uobject, attrs);
 
 err_tree_mutex_unlock:
-	if (f.file)
+	if (fd_file(f))
 		fdput(f);
 
 	mutex_unlock(&ibudev->xrcd_tree_mutex);
@@ -1051,7 +1051,7 @@ static int create_cq(struct uverbs_attr_bundle *attrs,
 	rdma_restrack_new(&cq->res, RDMA_RESTRACK_CQ);
 	rdma_restrack_set_name(&cq->res, NULL);
 
-	ret = ib_dev->ops.create_cq(cq, &attr, &attrs->driver_udata);
+	ret = ib_dev->ops.create_cq(cq, &attr, attrs);
 	if (ret)
 		goto err_free;
 	rdma_restrack_add(&cq->res);
@@ -1850,8 +1850,14 @@ static int modify_qp(struct uverbs_attr_bundle *attrs,
 		attr->path_mtu = cmd->base.path_mtu;
 	if (cmd->base.attr_mask & IB_QP_PATH_MIG_STATE)
 		attr->path_mig_state = cmd->base.path_mig_state;
-	if (cmd->base.attr_mask & IB_QP_QKEY)
+	if (cmd->base.attr_mask & IB_QP_QKEY) {
+		if (cmd->base.qkey & IB_QP_SET_QKEY &&
+		    !rdma_nl_get_privileged_qkey()) {
+			ret = -EPERM;
+			goto release_qp;
+		}
 		attr->qkey = cmd->base.qkey;
+	}
 	if (cmd->base.attr_mask & IB_QP_RQ_PSN)
 		attr->rq_psn = cmd->base.rq_psn;
 	if (cmd->base.attr_mask & IB_QP_SQ_PSN)
@@ -2004,11 +2010,13 @@ static int ib_uverbs_post_send(struct uverbs_attr_bundle *attrs)
 	ret = uverbs_request_start(attrs, &iter, &cmd, sizeof(cmd));
 	if (ret)
 		return ret;
-	wqes = uverbs_request_next_ptr(&iter, cmd.wqe_size * cmd.wr_count);
+	wqes = uverbs_request_next_ptr(&iter, size_mul(cmd.wqe_size,
+						       cmd.wr_count));
 	if (IS_ERR(wqes))
 		return PTR_ERR(wqes);
-	sgls = uverbs_request_next_ptr(
-		&iter, cmd.sge_count * sizeof(struct ib_uverbs_sge));
+	sgls = uverbs_request_next_ptr(&iter,
+				       size_mul(cmd.sge_count,
+						sizeof(struct ib_uverbs_sge)));
 	if (IS_ERR(sgls))
 		return PTR_ERR(sgls);
 	ret = uverbs_request_finish(&iter);
@@ -2194,11 +2202,11 @@ ib_uverbs_unmarshall_recv(struct uverbs_req_iter *iter, u32 wr_count,
 	if (wqe_size < sizeof(struct ib_uverbs_recv_wr))
 		return ERR_PTR(-EINVAL);
 
-	wqes = uverbs_request_next_ptr(iter, wqe_size * wr_count);
+	wqes = uverbs_request_next_ptr(iter, size_mul(wqe_size, wr_count));
 	if (IS_ERR(wqes))
 		return ERR_CAST(wqes);
-	sgls = uverbs_request_next_ptr(
-		iter, sge_count * sizeof(struct ib_uverbs_sge));
+	sgls = uverbs_request_next_ptr(iter, size_mul(sge_count,
+						      sizeof(struct ib_uverbs_sge)));
 	if (IS_ERR(sgls))
 		return ERR_CAST(sgls);
 	ret = uverbs_request_finish(iter);
@@ -2731,7 +2739,7 @@ int ib_uverbs_kern_spec_to_ib_spec_filter(enum ib_flow_spec_type type,
 
 	switch (ib_spec->type & ~IB_FLOW_SPEC_INNER) {
 	case IB_FLOW_SPEC_ETH:
-		ib_filter_sz = offsetof(struct ib_flow_eth_filter, real_sz);
+		ib_filter_sz = sizeof(struct ib_flow_eth_filter);
 		actual_filter_sz = spec_filter_size(kern_spec_mask,
 						    kern_filter_sz,
 						    ib_filter_sz);
@@ -2742,7 +2750,7 @@ int ib_uverbs_kern_spec_to_ib_spec_filter(enum ib_flow_spec_type type,
 		memcpy(&ib_spec->eth.mask, kern_spec_mask, actual_filter_sz);
 		break;
 	case IB_FLOW_SPEC_IPV4:
-		ib_filter_sz = offsetof(struct ib_flow_ipv4_filter, real_sz);
+		ib_filter_sz = sizeof(struct ib_flow_ipv4_filter);
 		actual_filter_sz = spec_filter_size(kern_spec_mask,
 						    kern_filter_sz,
 						    ib_filter_sz);
@@ -2753,7 +2761,7 @@ int ib_uverbs_kern_spec_to_ib_spec_filter(enum ib_flow_spec_type type,
 		memcpy(&ib_spec->ipv4.mask, kern_spec_mask, actual_filter_sz);
 		break;
 	case IB_FLOW_SPEC_IPV6:
-		ib_filter_sz = offsetof(struct ib_flow_ipv6_filter, real_sz);
+		ib_filter_sz = sizeof(struct ib_flow_ipv6_filter);
 		actual_filter_sz = spec_filter_size(kern_spec_mask,
 						    kern_filter_sz,
 						    ib_filter_sz);
@@ -2769,7 +2777,7 @@ int ib_uverbs_kern_spec_to_ib_spec_filter(enum ib_flow_spec_type type,
 		break;
 	case IB_FLOW_SPEC_TCP:
 	case IB_FLOW_SPEC_UDP:
-		ib_filter_sz = offsetof(struct ib_flow_tcp_udp_filter, real_sz);
+		ib_filter_sz = sizeof(struct ib_flow_tcp_udp_filter);
 		actual_filter_sz = spec_filter_size(kern_spec_mask,
 						    kern_filter_sz,
 						    ib_filter_sz);
@@ -2780,7 +2788,7 @@ int ib_uverbs_kern_spec_to_ib_spec_filter(enum ib_flow_spec_type type,
 		memcpy(&ib_spec->tcp_udp.mask, kern_spec_mask, actual_filter_sz);
 		break;
 	case IB_FLOW_SPEC_VXLAN_TUNNEL:
-		ib_filter_sz = offsetof(struct ib_flow_tunnel_filter, real_sz);
+		ib_filter_sz = sizeof(struct ib_flow_tunnel_filter);
 		actual_filter_sz = spec_filter_size(kern_spec_mask,
 						    kern_filter_sz,
 						    ib_filter_sz);
@@ -2795,7 +2803,7 @@ int ib_uverbs_kern_spec_to_ib_spec_filter(enum ib_flow_spec_type type,
 			return -EINVAL;
 		break;
 	case IB_FLOW_SPEC_ESP:
-		ib_filter_sz = offsetof(struct ib_flow_esp_filter, real_sz);
+		ib_filter_sz = sizeof(struct ib_flow_esp_filter);
 		actual_filter_sz = spec_filter_size(kern_spec_mask,
 						    kern_filter_sz,
 						    ib_filter_sz);
@@ -2806,7 +2814,7 @@ int ib_uverbs_kern_spec_to_ib_spec_filter(enum ib_flow_spec_type type,
 		memcpy(&ib_spec->esp.mask, kern_spec_mask, actual_filter_sz);
 		break;
 	case IB_FLOW_SPEC_GRE:
-		ib_filter_sz = offsetof(struct ib_flow_gre_filter, real_sz);
+		ib_filter_sz = sizeof(struct ib_flow_gre_filter);
 		actual_filter_sz = spec_filter_size(kern_spec_mask,
 						    kern_filter_sz,
 						    ib_filter_sz);
@@ -2817,7 +2825,7 @@ int ib_uverbs_kern_spec_to_ib_spec_filter(enum ib_flow_spec_type type,
 		memcpy(&ib_spec->gre.mask, kern_spec_mask, actual_filter_sz);
 		break;
 	case IB_FLOW_SPEC_MPLS:
-		ib_filter_sz = offsetof(struct ib_flow_mpls_filter, real_sz);
+		ib_filter_sz = sizeof(struct ib_flow_mpls_filter);
 		actual_filter_sz = spec_filter_size(kern_spec_mask,
 						    kern_filter_sz,
 						    ib_filter_sz);

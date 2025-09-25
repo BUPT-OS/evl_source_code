@@ -23,16 +23,9 @@
 #include <linux/ptrace.h>
 #include <linux/math64.h>
 #include <linux/cn_proc.h>
-#include <uapi/linux/sched/types.h>
-#include <evl/sched.h>
-#include <evl/timer.h>
-#include <evl/wait.h>
-#include <evl/clock.h>
-#include <evl/stat.h>
 #include <evl/assert.h>
 #include <evl/thread.h>
 #include <evl/memory.h>
-#include <evl/file.h>
 #include <evl/monitor.h>
 #include <evl/mutex.h>
 #include <evl/poll.h>
@@ -41,6 +34,7 @@
 #include <evl/observable.h>
 #include <evl/uaccess.h>
 #include <evl/lock.h>
+#include <uapi/linux/sched/types.h>
 #include <trace/events/evl.h>
 
 #define EVL_THREAD_CLONE_FLAGS	\
@@ -473,7 +467,7 @@ int __evl_run_kthread(struct evl_kthread *kthread, int clone_flags)
 	if (ret)
 		goto fail_element;
 
-	ret = evl_create_core_element_device(&thread->element,
+	ret = evl_create_element_device(&thread->element,
 					&evl_thread_factory,
 					thread->name);
 	if (ret)
@@ -1562,6 +1556,7 @@ void handle_oob_trap_entry(unsigned int trapnr, struct pt_regs *regs)
 {
 	struct evl_thread *curr;
 	bool is_bp = false;
+	int diag;
 
 	trace_evl_thread_fault(trapnr, regs);
 
@@ -1601,7 +1596,11 @@ void handle_oob_trap_entry(unsigned int trapnr, struct pt_regs *regs)
 	 * We received a trap on the oob stage, switch to in-band
 	 * before handling the exception.
 	 */
-	evl_switch_inband(is_bp ? EVL_HMDIAG_TRAP : EVL_HMDIAG_EXDEMOTE);
+	diag = is_bp ? EVL_HMDIAG_TRAP : EVL_HMDIAG_EXDEMOTE;
+	if (user_mode(regs))
+		evl_switch_inband_details(diag, evl_intval(instruction_pointer(regs)));
+	else
+		evl_switch_inband(diag);
 }
 
 /* hard irqs off */
@@ -1615,6 +1614,9 @@ void handle_oob_trap_exit(unsigned int trapnr, struct pt_regs *regs)
 		return;
 
 	hard_local_irq_enable();
+
+	if (curr == NULL)
+		return;
 
 	curr->local_info &= ~EVL_T_INFAULT;
 
@@ -1998,7 +2000,7 @@ static int set_time_slice(struct evl_thread *thread, ktime_t quantum)
 		if (quantum <= evl_get_clock_gravity(&evl_mono_clock, user))
 			return -EINVAL;
 
-		if (thread->base_class->sched_tick == NULL)
+		if (thread->base_class->sched_yield == NULL)
 			return -EINVAL;
 
 		thread->state |= EVL_T_RRB;
@@ -2508,10 +2510,10 @@ thread_factory_build(struct evl_factory *fac, const char __user *u_name,
 		}
 		/*
 		 * Element name was already set from user input by
-		 * evl_alloc_observable(). evl_create_core_element_device()
+		 * evl_alloc_observable(). evl_create_element_device()
 		 * is told to skip name assignment (NULL name).
 		 */
-		ret = evl_create_core_element_device(
+		ret = evl_create_element_device(
 			&observable->element,
 			&evl_observable_factory, NULL);
 		if (ret)

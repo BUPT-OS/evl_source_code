@@ -142,7 +142,7 @@ static __always_inline int test_oob_stall(void)
 static __always_inline
 struct irq_stage_data *this_staged(struct irq_stage *stage)
 {
-	return &raw_cpu_ptr(irq_pipeline.stages)[stage->index];
+	return &raw_cpu_ptr(&irq_pipeline.stages[0])[stage->index];
 }
 
 /**
@@ -191,7 +191,7 @@ static __always_inline struct irq_stage_data *this_oob_staged(void)
 
 static __always_inline struct irq_stage_data *__current_irq_staged(void)
 {
-	return &raw_cpu_ptr(irq_pipeline.stages)[stage_level()];
+	return &raw_cpu_ptr(&irq_pipeline.stages[0])[stage_level()];
 }
 
 /**
@@ -316,19 +316,6 @@ static __always_inline void oob_irq_restore(unsigned long x)
 		__oob_irq_restore(x);
 }
 
-bool stage_disabled(void);
-
-unsigned long test_and_lock_stage(int *irqsoff);
-
-void unlock_stage(unsigned long irqstate);
-
-#define stage_save_flags(__irqstate)					\
-  	do {								\
-	  unsigned long __flags = hard_local_save_flags();		\
-	  (__irqstate) = irqs_merge_flags(__flags,			\
-					  irqs_disabled());		\
-	} while (0)
-
 int enable_oob_stage(const char *name);
 
 int arch_enable_oob_stage(void);
@@ -360,27 +347,10 @@ static __always_inline bool oob_stage_present(void)
 	return false;
 }
 
-static __always_inline bool stage_disabled(void)
-{
-	return irqs_disabled();
-}
-
 static __always_inline void irq_post_inband(unsigned int irq)
 {
 	call_is_nop_without_pipelining();
 }
-
-#define test_and_lock_stage(__irqsoff)				\
-	({							\
-		unsigned long __flags;				\
-		raw_local_irq_save(__flags);			\
-		*(__irqsoff) = irqs_disabled_flags(__flags);	\
-		__flags;					\
-	})
-
-#define unlock_stage(__flags)		raw_local_irq_restore(__flags)
-
-#define stage_save_flags(__flags)	raw_local_save_flags(__flags)
 
 static __always_inline void stall_inband_nocheck(void)
 { }

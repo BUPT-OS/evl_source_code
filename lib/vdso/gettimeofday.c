@@ -22,38 +22,38 @@ static inline bool vdso_cycles_ok(u64 cycles)
 }
 #endif
 
-#if defined(CONFIG_GENERIC_CLOCKSOURCE_VDSO) && !defined(BUILD_VDSO32)
+#if defined(CONFIG_GENERIC_CLOCKSOURCE_VDSO) && (!defined(CONFIG_COMPAT_VDSO) || !defined(BUILD_VDSO32))
 
 #include <linux/fcntl.h>
 #include <linux/io.h>
 #include <linux/ioctl.h>
 #include <uapi/linux/clocksource.h>
 
-static notrace u64 readl_mmio_up(const struct clksrc_info *vinfo)
+static __always_inline notrace u64 readl_mmio_up(const struct clksrc_info *vinfo)
 {
 	const struct clksrc_user_mmio_info *info = &vinfo->mmio;
 	return readl_relaxed(info->reg_lower);
 }
 
-static notrace u64 readl_mmio_down(const struct clksrc_info *vinfo)
+static __always_inline notrace u64 readl_mmio_down(const struct clksrc_info *vinfo)
 {
 	const struct clksrc_user_mmio_info *info = &vinfo->mmio;
 	return ~(u64)readl_relaxed(info->reg_lower) & info->mask_lower;
 }
 
-static notrace u64 readw_mmio_up(const struct clksrc_info *vinfo)
+static __always_inline notrace u64 readw_mmio_up(const struct clksrc_info *vinfo)
 {
 	const struct clksrc_user_mmio_info *info = &vinfo->mmio;
 	return readw_relaxed(info->reg_lower);
 }
 
-static notrace u64 readw_mmio_down(const struct clksrc_info *vinfo)
+static __always_inline notrace u64 readw_mmio_down(const struct clksrc_info *vinfo)
 {
 	const struct clksrc_user_mmio_info *info = &vinfo->mmio;
 	return ~(u64)readl_relaxed(info->reg_lower) & info->mask_lower;
 }
 
-static notrace u64 readl_dmmio_up(const struct clksrc_info *vinfo)
+static __always_inline notrace u64 readl_dmmio_up(const struct clksrc_info *vinfo)
 {
 	const struct clksrc_user_mmio_info *info = &vinfo->mmio;
 	void __iomem *reg_lower, *reg_upper;
@@ -72,7 +72,7 @@ static notrace u64 readl_dmmio_up(const struct clksrc_info *vinfo)
 	return (((u64)upper) << info->bits_lower) | lower;
 }
 
-static notrace u64 readw_dmmio_up(const struct clksrc_info *vinfo)
+static __always_inline notrace u64 readw_dmmio_up(const struct clksrc_info *vinfo)
 {
 	const struct clksrc_user_mmio_info *info = &vinfo->mmio;
 	void __iomem *reg_lower, *reg_upper;
@@ -89,26 +89,6 @@ static notrace u64 readw_dmmio_up(const struct clksrc_info *vinfo)
 	} while (upper != old_upper);
 
 	return (((u64)upper) << info->bits_lower) | lower;
-}
-
-static notrace __cold vdso_read_cycles_t *get_mmio_read_cycles(unsigned int type)
-{
-	switch (type) {
-	case CLKSRC_MMIO_L_UP:
-		return &readl_mmio_up;
-	case CLKSRC_MMIO_L_DOWN:
-		return &readl_mmio_down;
-	case CLKSRC_MMIO_W_UP:
-		return &readw_mmio_up;
-	case CLKSRC_MMIO_W_DOWN:
-		return &readw_mmio_down;
-	case CLKSRC_DMMIO_L_UP:
-		return &readl_dmmio_up;
-	case CLKSRC_DMMIO_W_UP:
-		return &readw_dmmio_up;
-	default:
-		return NULL;
-	}
 }
 
 static __always_inline u16 to_cs_type(u32 cs_type_seq)
@@ -163,9 +143,29 @@ void map_clocksource(const struct vdso_data *vd, struct vdso_priv *vp,
 	if (ret < 0)
 		goto fallback_to_syscall;
 
-	read_cycles = get_mmio_read_cycles(info->mmio.type);
-	if (read_cycles == NULL) /* Mmhf, misconfigured. */
+	switch (info->mmio.type) {
+	case CLKSRC_MMIO_L_UP:
+		read_cycles = &readl_mmio_up;
+		break;
+	case CLKSRC_MMIO_L_DOWN:
+		read_cycles = &readl_mmio_down;
+		break;
+	case CLKSRC_MMIO_W_UP:
+		read_cycles = &readw_mmio_up;
+		break;
+	case CLKSRC_MMIO_W_DOWN:
+		read_cycles = &readw_mmio_down;
+		break;
+	case CLKSRC_DMMIO_L_UP:
+		read_cycles = &readl_dmmio_up;
+		break;
+	case CLKSRC_DMMIO_W_UP:
+		read_cycles = &readw_dmmio_up;
+		break;
+	default:
+		/* Mmhf, misconfigured. */
 		goto fallback_to_syscall;
+	}
 done:
 	info->read_cycles = read_cycles;
 	smp_wmb();
@@ -244,15 +244,23 @@ bool get_hw_counter(const struct vdso_data *vd, u32 *r_seq, u64 *cycles)
 
 #endif /* CONFIG_GENERIC_CLOCKSOURCE_VDSO */
 
-#ifndef vdso_calc_delta
-/*
- * Default implementation which works for all sane clocksources. That
- * obviously excludes x86/TSC.
- */
-static __always_inline
-u64 vdso_calc_delta(u64 cycles, u64 last, u64 mask, u32 mult)
+#ifndef vdso_calc_ns
+
+#ifdef VDSO_DELTA_NOMASK
+# define VDSO_DELTA_MASK(vd)	ULLONG_MAX
+#else
+# define VDSO_DELTA_MASK(vd)	(vd->mask)
+#endif
+
+#ifdef CONFIG_GENERIC_VDSO_OVERFLOW_PROTECT
+static __always_inline bool vdso_delta_ok(const struct vdso_data *vd, u64 delta)
 {
-	return ((cycles - last) & mask) * mult;
+	return delta < vd->max_cycles;
+}
+#else
+static __always_inline bool vdso_delta_ok(const struct vdso_data *vd, u64 delta)
+{
+	return true;
 }
 #endif
 
@@ -262,6 +270,21 @@ static __always_inline u64 vdso_shift_ns(u64 ns, u32 shift)
 	return ns >> shift;
 }
 #endif
+
+/*
+ * Default implementation which works for all sane clocksources. That
+ * obviously excludes x86/TSC.
+ */
+static __always_inline u64 vdso_calc_ns(const struct vdso_data *vd, u64 cycles, u64 base)
+{
+	u64 delta = (cycles - vd->cycle_last) & VDSO_DELTA_MASK(vd);
+
+	if (likely(vdso_delta_ok(vd, delta)))
+		return vdso_shift_ns((delta * vd->mult) + base, vd->shift);
+
+	return mul_u64_u32_add_u64_shr(delta, vd->mult, base, vd->shift);
+}
+#endif /* vdso_calc_ns */
 
 #ifndef __arch_vdso_hres_capable
 static inline bool __arch_vdso_hres_capable(void)
@@ -274,10 +297,10 @@ static inline bool __arch_vdso_hres_capable(void)
 static __always_inline int do_hres_timens(const struct vdso_data *vdns, clockid_t clk,
 					  struct __kernel_timespec *ts)
 {
-	const struct vdso_data *vd;
 	const struct timens_offset *offs = &vdns->offset[clk];
 	const struct vdso_timestamp *vdso_ts;
-	u64 cycles, last, ns;
+	const struct vdso_data *vd;
+	u64 cycles, ns;
 	u32 seq;
 	s64 sec;
 
@@ -292,10 +315,7 @@ static __always_inline int do_hres_timens(const struct vdso_data *vdns, clockid_
 	do {
 		if (!get_hw_counter(vd, &seq, &cycles))
 			return -1;
-		ns = vdso_ts->nsec;
-		last = vd->cycle_last;
-		ns += vdso_calc_delta(cycles, last, vd->mask, vd->mult);
-		ns = vdso_shift_ns(ns, vd->shift);
+		ns = vdso_calc_ns(vd, cycles, vdso_ts->nsec);
 		sec = vdso_ts->sec;
 	} while (unlikely(vdso_read_retry(vd, seq)));
 
@@ -330,7 +350,7 @@ static __always_inline int do_hres(const struct vdso_data *vd, clockid_t clk,
 				   struct __kernel_timespec *ts)
 {
 	const struct vdso_timestamp *vdso_ts = &vd->basetime[clk];
-	u64 cycles, last, sec, ns;
+	u64 cycles, sec, ns;
 	u32 seq;
 
 	/* Allows to compile the high resolution parts out */
@@ -339,16 +359,15 @@ static __always_inline int do_hres(const struct vdso_data *vd, clockid_t clk,
 
 	do {
 		/*
-		 * Open coded to handle VDSO_CLOCKMODE_TIMENS. Time
-		 * namespace enabled tasks have a special VVAR page
-		 * installed which has vd->seq set to 1 and
-		 * vd->clock_mode set to VDSO_CLOCKMODE_TIMENS. For
-		 * non time namespace affected tasks this does not
-		 * affect performance because if vd->seq is odd,
-		 * i.e. a concurrent update is in progress the extra
-		 * check for vd->clock_mode is just a few extra
-		 * instructions while spin waiting for vd->seq to
-		 * become even again.
+		 * Open coded function vdso_read_begin() to handle
+		 * VDSO_CLOCKMODE_TIMENS. Time namespace enabled tasks have a
+		 * special VVAR page installed which has vd->seq set to 1 and
+		 * vd->clock_mode set to VDSO_CLOCKMODE_TIMENS. For non time
+		 * namespace affected tasks this does not affect performance
+		 * because if vd->seq is odd, i.e. a concurrent update is in
+		 * progress the extra check for vd->clock_mode is just a few
+		 * extra instructions while spin waiting for vd->seq to become
+		 * even again.
 		 */
 		while (unlikely((seq = READ_ONCE(vd->seq)) & 1)) {
 			if (IS_ENABLED(CONFIG_TIME_NS) &&
@@ -362,10 +381,7 @@ static __always_inline int do_hres(const struct vdso_data *vd, clockid_t clk,
 		if (!get_hw_counter(vd, &seq, &cycles))
 			return -1;
 
-		ns = vdso_ts->nsec;
-		last = vd->cycle_last;
-		ns += vdso_calc_delta(cycles, last, vd->mask, vd->mult);
-		ns = vdso_shift_ns(ns, vd->shift);
+		ns = vdso_calc_ns(vd, cycles, vdso_ts->nsec);
 		sec = vdso_ts->sec;
 	} while (unlikely(vdso_read_retry(vd, seq)));
 
@@ -424,8 +440,8 @@ static __always_inline int do_coarse(const struct vdso_data *vd, clockid_t clk,
 
 	do {
 		/*
-		 * Open coded to handle VDSO_CLOCK_TIMENS. See comment in
-		 * do_hres().
+		 * Open coded function vdso_read_begin() to handle
+		 * VDSO_CLOCK_TIMENS. See comment in do_hres().
 		 */
 		while ((seq = READ_ONCE(vd->seq)) & 1) {
 			if (IS_ENABLED(CONFIG_TIME_NS) &&

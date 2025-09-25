@@ -12,7 +12,9 @@
 #ifndef _LINUX_TRACE_IRQFLAGS_H
 #define _LINUX_TRACE_IRQFLAGS_H
 
+#include <linux/irqflags_types.h>
 #include <linux/typecheck.h>
+#include <linux/cleanup.h>
 #include <asm-generic/irq_pipeline.h>
 #include <asm/irqflags.h>
 #include <asm/percpu.h>
@@ -33,19 +35,6 @@
 #endif
 
 #ifdef CONFIG_TRACE_IRQFLAGS
-
-/* Per-task IRQ trace events information. */
-struct irqtrace_events {
-	unsigned int	irq_events;
-	unsigned long	hardirq_enable_ip;
-	unsigned long	hardirq_disable_ip;
-	unsigned int	hardirq_enable_event;
-	unsigned int	hardirq_disable_event;
-	unsigned long	softirq_disable_ip;
-	unsigned long	softirq_enable_ip;
-	unsigned int	softirq_disable_event;
-	unsigned int	softirq_enable_event;
-};
 
 DECLARE_PER_CPU(int, hardirqs_enabled);
 DECLARE_PER_CPU(int, hardirq_context);
@@ -130,7 +119,7 @@ do {						\
 # define lockdep_softirq_enter()		do { } while (0)
 # define lockdep_softirq_exit()			do { } while (0)
 # define lockdep_hrtimer_enter(__hrtimer)	false
-# define lockdep_hrtimer_exit(__context)	do { } while (0)
+# define lockdep_hrtimer_exit(__context)	do { (void)(__context); } while (0)
 # define lockdep_posixtimer_enter()		do { } while (0)
 # define lockdep_posixtimer_exit()		do { } while (0)
 # define lockdep_irq_work_enter(__work)		do { } while (0)
@@ -265,18 +254,25 @@ extern void warn_bogus_irq_restore(void);
 		local_irq_disable();		\
 	} while (0)
 
-#define local_irq_save_full(__flags)		\
-  	do {					\
-		hard_local_irq_disable();	\
-		local_irq_save(__flags);	\
+#define local_irq_save_full(__flags)					\
+	do {								\
+		bool __was_unstalled = running_inband() && !raw_irqs_disabled(); \
+		(__flags) = test_and_lock_stage(NULL);			\
+		if (__was_unstalled)					\
+			trace_hardirqs_off();				\
 	} while (0)
 
-#define local_irq_restore_full(__flags)			\
-	do {						\
-		if (!irqs_disabled_flags(__flags))	\
-			hard_local_irq_enable();	\
-		local_irq_restore(__flags);		\
+#define local_irq_restore_full(__flags)					\
+	do {								\
+		if (running_inband()) {					\
+			bool __stalled;					\
+			stage_disabled_flags(__flags, &__stalled);	\
+			if (!__stalled)					\
+				trace_hardirqs_on();			\
+		}							\
+		unlock_stage(__flags);					\
 	} while (0)
+
 #else
 #define local_irq_enable_full()		local_irq_enable()
 #define local_irq_disable_full()	local_irq_disable()
@@ -303,5 +299,11 @@ extern void warn_bogus_irq_restore(void);
 #endif /* CONFIG_TRACE_IRQFLAGS_SUPPORT */
 
 #define irqs_disabled_flags(flags) raw_irqs_disabled_flags(flags)
+
+DEFINE_LOCK_GUARD_0(irq, local_irq_disable(), local_irq_enable())
+DEFINE_LOCK_GUARD_0(irqsave,
+		    local_irq_save(_T->flags),
+		    local_irq_restore(_T->flags),
+		    unsigned long flags)
 
 #endif

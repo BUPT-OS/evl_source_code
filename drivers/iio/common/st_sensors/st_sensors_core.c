@@ -16,7 +16,7 @@
 #include <linux/property.h>
 #include <linux/regulator/consumer.h>
 #include <linux/regmap.h>
-#include <asm/unaligned.h>
+#include <linux/unaligned.h>
 #include <linux/iio/common/st_sensors.h>
 
 #include "st_sensors_core.h"
@@ -219,47 +219,22 @@ int st_sensors_set_axis_enable(struct iio_dev *indio_dev, u8 axis_enable)
 }
 EXPORT_SYMBOL_NS(st_sensors_set_axis_enable, IIO_ST_SENSORS);
 
-static void st_reg_disable(void *reg)
-{
-	regulator_disable(reg);
-}
 
 int st_sensors_power_enable(struct iio_dev *indio_dev)
 {
-	struct st_sensor_data *pdata = iio_priv(indio_dev);
+	static const char * const regulator_names[] = { "vdd", "vddio" };
 	struct device *parent = indio_dev->dev.parent;
 	int err;
 
 	/* Regulators not mandatory, but if requested we should enable them. */
-	pdata->vdd = devm_regulator_get(parent, "vdd");
-	if (IS_ERR(pdata->vdd))
-		return dev_err_probe(&indio_dev->dev, PTR_ERR(pdata->vdd),
-				     "unable to get Vdd supply\n");
-
-	err = regulator_enable(pdata->vdd);
-	if (err != 0) {
-		dev_warn(&indio_dev->dev,
-			 "Failed to enable specified Vdd supply\n");
-		return err;
-	}
-
-	err = devm_add_action_or_reset(parent, st_reg_disable, pdata->vdd);
+	err = devm_regulator_bulk_get_enable(parent,
+					     ARRAY_SIZE(regulator_names),
+					     regulator_names);
 	if (err)
-		return err;
+		return dev_err_probe(&indio_dev->dev, err,
+				     "unable to enable supplies\n");
 
-	pdata->vdd_io = devm_regulator_get(parent, "vddio");
-	if (IS_ERR(pdata->vdd_io))
-		return dev_err_probe(&indio_dev->dev, PTR_ERR(pdata->vdd_io),
-				     "unable to get Vdd_IO supply\n");
-
-	err = regulator_enable(pdata->vdd_io);
-	if (err != 0) {
-		dev_warn(&indio_dev->dev,
-			 "Failed to enable specified Vdd_IO supply\n");
-		return err;
-	}
-
-	return devm_add_action_or_reset(parent, st_reg_disable, pdata->vdd_io);
+	return 0;
 }
 EXPORT_SYMBOL_NS(st_sensors_power_enable, IIO_ST_SENSORS);
 
@@ -631,10 +606,9 @@ int st_sensors_verify_id(struct iio_dev *indio_dev)
 		}
 
 		if (sdata->sensor_settings->wai != wai) {
-			dev_err(&indio_dev->dev,
+			dev_warn(&indio_dev->dev,
 				"%s: WhoAmI mismatch (0x%x).\n",
 				indio_dev->name, wai);
-			return -EINVAL;
 		}
 	}
 

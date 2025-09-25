@@ -24,11 +24,35 @@ struct evl_work {
 	struct evl_element *element;
 };
 
+#define EVL_DEFINE_WORK(__work, __handler)				\
+	struct evl_work __work = {					\
+		.irq_work = IRQ_WORK_INIT(__evl_do_irq_work),		\
+		.wq_work = __WORK_INITIALIZER((__work).wq_work,		\
+					__evl_do_work),			\
+		.wq = NULL,						\
+		.handler_noreturn = (void (*)(void *))__handler,	\
+		.element = NULL,					\
+	}
+
 struct evl_sync_work {
 	struct evl_work work;
 	struct evl_flag done;
 	int result;
 };
+
+#define EVL_DEFINE_SYNC_WORK(__work, __handler)				\
+	struct evl_sync_work __work = {					\
+		.work = {						\
+			.irq_work = IRQ_WORK_INIT(__evl_do_irq_work),	\
+			.wq_work = __WORK_INITIALIZER((__work).work.wq_work, \
+						__evl_do_sync_work),	\
+			.wq = NULL,					\
+			.handler = (int (*)(void *))__handler,		\
+			.element = NULL,				\
+		},							\
+		.done = EVL_FLAG_INITIALIZER((__work).done),		\
+		.result = 0,						\
+	}
 
 void evl_init_work(struct evl_work *work,
 		   void (*handler)(struct evl_work *work));
@@ -40,12 +64,12 @@ void evl_init_work_safe(struct evl_work *work,
 void evl_init_sync_work(struct evl_sync_work *sync_work,
 			int (*handler)(struct evl_sync_work *sync_work));
 
-void evl_call_inband_from(struct evl_work *work,
+bool evl_call_inband_from(struct evl_work *work,
 			struct workqueue_struct *wq);
 
-static inline void evl_call_inband(struct evl_work *work)
+static inline bool evl_call_inband(struct evl_work *work)
 {
-	evl_call_inband_from(work, system_wq);
+	return evl_call_inband_from(work, system_wq);
 }
 
 static inline
@@ -76,5 +100,9 @@ void evl_flush_sync_work(struct evl_sync_work *sync_work)
 {
 	evl_flush_work(&sync_work->work);
 }
+
+void __evl_do_irq_work(struct irq_work *irq_work);
+void __evl_do_work(struct work_struct *wq_work);
+void __evl_do_sync_work(struct work_struct *wq_work);
 
 #endif /* !_EVL_WORK_H */

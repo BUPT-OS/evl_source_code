@@ -9,7 +9,6 @@
 #include <linux/skbuff.h>
 #include <evl/list.h>
 #include <evl/net/qdisc.h>
-#include <uapi/evl/net/sched.h>
 
 struct qdisc_fifo_priv {
 	struct evl_net_skb_queue q;
@@ -41,11 +40,12 @@ static int enqueue_qdisc_fifo(struct evl_net_qdisc *qdisc,
 	return 0;
 }
 
-static struct sk_buff *dequeue_qdisc_fifo(struct evl_net_qdisc *qdisc)
+static struct sk_buff *dequeue_qdisc_fifo(struct evl_net_qdisc *qdisc,
+					bool *more)
 {
 	struct qdisc_fifo_priv *p = evl_qdisc_priv(qdisc);
 
-	return evl_net_get_skb_queue(&p->q);
+	return evl_net_get_skb_queue(&p->q, more);
 }
 
 struct evl_net_qdisc_ops evl_net_qdisc_fifo = {

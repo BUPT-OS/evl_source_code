@@ -7,7 +7,7 @@
 #include <linux/types.h>
 #include <linux/uaccess.h>
 #include <evl/factory.h>
-#include <uapi/evl/trace.h>
+#include <uapi/evl/trace-abi.h>
 #include <trace/events/evl.h>
 
 static long trace_common_ioctl(struct file *filp, unsigned int cmd,

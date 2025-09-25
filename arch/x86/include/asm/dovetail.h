@@ -10,6 +10,7 @@
 
 #include <asm/io_bitmap.h>
 #include <asm/fpu/api.h>
+#include <linux/compat.h>
 
 static inline void arch_dovetail_exec_prepare(void)
 {
@@ -40,6 +41,9 @@ void arch_dovetail_switch_finish(bool enter_inband)
 	}
 }
 
-#endif
+#define arch_dovetail_is_prctl(__nr)	\
+	(in_compat_syscall() ? (__nr) == __NR_ia32_prctl : (__nr) == __NR_prctl)
+
+#endif	/* !__ASSEMBLY__ && CONFIG_DOVETAIL */
 
 #endif /* _ASM_X86_DOVETAIL_H */

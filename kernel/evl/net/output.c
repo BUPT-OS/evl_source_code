@@ -21,28 +21,69 @@
 
 static void xmit_inband(struct irq_work *work);
 
-DEFINE_IRQ_WORK(oob_xmit_work, xmit_inband);
+static DEFINE_IRQ_WORK(oob_xmit_work, xmit_inband);
 
 static DEFINE_PER_CPU(struct evl_net_skb_queue, oob_tx_relay);
 
-static inline netdev_tx_t
-oob_start_xmit(struct net_device *dev, struct sk_buff *skb)
+static void timestamp_at_device(struct sk_buff *skb)
 {
+	if (skb_is_oob_timestamped(skb)) {
+		skb_shinfo_oob(skb)->device_time = evl_ktime_monotonic();
+		evl_queue_iots_tx(skb);
+	}
+}
+
+static void timestamp_at_sched(struct sk_buff *skb)
+{
+	struct evl_socket *esk = EVL_NET_CB(skb)->tracker;
+	int tsflags;
+
+	if (likely(esk)) {
+		tsflags = READ_ONCE(esk->timestamping);
+		if (tsflags & EVL_SOF_TIMESTAMP_TX &&
+			tsflags & EVL_SOF_TIMESTAMP_QUEUING)
+			skb_shinfo_oob(skb)->queuing_time = evl_ktime_monotonic();
+	}
+}
+
+static inline netdev_tx_t
+oob_start_xmit(struct net_device *dev, struct sk_buff *skb, bool more)
+{
+	struct netdev_queue *txq;
+	netdev_tx_t ret;
+
+	/*
+	 * We don't check the queue index using netdev_cap_txqueue(),
+	 * assuming the inband code does so routinely for in-band
+	 * traffic.
+	 */
+	txq = netdev_get_tx_queue(dev, skb_get_queue_mapping(skb));
+
 	/*
 	 * If we got there, @dev is deemed oob-capable
 	 * (IFF_OOB_CAPABLE, see evl_net_transmit()). The driver should
 	 * check the current execution stage for handling the
 	 * out-of-band packet properly.
 	 */
-	return dev->netdev_ops->ndo_start_xmit(skb, dev);
+	netif_tx_lock_oob(txq);
+	ret = netdev_start_xmit(skb, dev, txq, more);
+	netif_tx_unlock_oob(txq);
+
+	return ret;
 }
 
 static inline void do_tx(struct evl_net_qdisc *qdisc,
-			struct net_device *dev, struct sk_buff *skb)
+			struct net_device *dev, struct sk_buff *skb,
+			bool more)
 {
-	evl_uncharge_socket_wmem(skb);
+	/*
+	 * CAUTION: We must timestamp before uncharging which clears
+	 * the socket tracking info.
+	 */
+	timestamp_at_device(skb);
+	evl_net_uncharge_skb_wmem(skb);
 
-	switch (oob_start_xmit(dev, skb)) {
+	switch (oob_start_xmit(dev, skb, more)) {
 	case NETDEV_TX_OK:
 		break;
 	default: /* busy, or whatever */
@@ -58,11 +99,11 @@ void evl_net_do_tx(void *arg)
 	struct net_device *dev = arg;
 	struct evl_netdev_state *est;
 	struct evl_net_qdisc *qdisc;
-	struct sk_buff *skb, *n;
+	struct sk_buff *skb;
 	LIST_HEAD(list);
 	int ret;
 
-	est = dev->oob_context.dev_state.estate;
+	est = dev->oob_state.estate;
 
 	while (!evl_kthread_should_stop()) {
 		ret = evl_wait_flag(&est->tx_flag);
@@ -70,61 +111,66 @@ void evl_net_do_tx(void *arg)
 			break;
 
 		/*
-		 * Reread queueing discipline descriptor to allow
-		 * dynamic updates. FIXME: protect this against
-		 * swap/deletion while pulling packets (stax?).
+		 * FIXME: stax-protect this against swap while pulling
+		 * packets.
 		 */
 		qdisc = est->qdisc;
 
 		/*
-		 * First we transmit the traffic as prioritized by the
-		 * out-of-band queueing discipline attached to our
-		 * device.
+		 * Transmit the traffic according to the
+		 * prioritization implemented by the queueing
+		 * discipline attached to our device.
 		 */
 		for (;;) {
-			skb = qdisc->oob_ops->dequeue(qdisc);
+			bool more;
+			skb = qdisc->oob_ops->dequeue(qdisc, &more);
 			if (skb == NULL)
 				break;
-			do_tx(qdisc, dev, skb);
-		}
-
-		/*
-		 * Lastly, we send out any pending traffic we received from the
-		 * in-band sch_oob Qdisc.
-		 */
-		if (evl_net_move_skb_queue(&qdisc->inband_q, &list)) {
-			list_for_each_entry_safe(skb, n, &list, list) {
-				list_del_init(&skb->list);
-				do_tx(qdisc, dev, skb);
-			}
+			do_tx(qdisc, dev, skb, more);
 		}
 	}
 }
 
 static void skb_xmit_inband(struct sk_buff *skb)
 {
-	evl_uncharge_socket_wmem(skb);
+	/*
+	 * Timestamping at device here is technically wrong because
+	 * dev_queue_xmit() may queue and delay the buffer for
+	 * transmission, but this is harmless, we don't have to be
+	 * accurate when measuring output delays in best-effort mode,
+	 * i.e. via the in-band stack, what matters is the oob path.
+	 *
+	 * CAUTION: wait for the timestamping to take place before
+	 * uncharging the socket for the memory, which might allow the
+	 * tracker to go stale on a different CPU (see how the wmem
+	 * crossing is used to synchronize with in-flight TX buffers
+	 * in disable_oob_port().
+	 */
+	timestamp_at_device(skb);
+	evl_net_uncharge_skb_wmem(skb);
 	skb->prev = NULL;
 	skb->next = NULL;
 	dev_queue_xmit(skb);
 }
 
 /* in-band hook, called upon NET_TX_SOFTIRQ. */
-void skb_inband_xmit_backlog(void)
+void process_inband_tx_backlog(struct softnet_data *sd)
 {
 	struct sk_buff *skb, *n;
 	LIST_HEAD(list);
 
 	if (evl_net_move_skb_queue(this_cpu_ptr(&oob_tx_relay), &list)) {
-		list_for_each_entry_safe(skb, n, &list, list)
+		list_for_each_entry_safe(skb, n, &list, list) {
+			list_del(&skb->list);
 			skb_xmit_inband(skb);
+		}
 	}
 }
 
 static void xmit_inband(struct irq_work *work) /* in-band, stalled */
 {
 	/*
-	 * skb_inband_xmit_backlog() should run soon, kicked by tx_action.
+	 * process_inband_tx_backlog() should run soon, kicked by tx_action.
 	 */
 	__raise_softirq_irqoff(NET_TX_SOFTIRQ);
 }
@@ -132,7 +178,7 @@ static void xmit_inband(struct irq_work *work) /* in-band, stalled */
 /* oob or in-band */
 static int xmit_oob(struct net_device *dev, struct sk_buff *skb)
 {
-	struct evl_netdev_state *est = dev->oob_context.dev_state.estate;
+	struct evl_netdev_state *est = dev->oob_state.estate;
 	int ret;
 
 	ret = evl_net_sched_packet(dev, skb);
@@ -151,7 +197,7 @@ static int xmit_oob(struct net_device *dev, struct sk_buff *skb)
  *	Add an outgoing packet to the out-of-band transmit queue, so
  *	that it will be handed over to the device referred to by
  *	@skb->dev. The packet is complete (e.g. the VLAN tag is set if
- *	@skb->dev is an ethernet device).
+ *	@skb->dev is a VLAN device).
  *
  *	@skb the packet to queue. Must not be linked to any upstream
  *	queue.
@@ -160,7 +206,6 @@ static int xmit_oob(struct net_device *dev, struct sk_buff *skb)
  *	- skb->dev is a valid (real) device. The caller must prevent from
  *        the interface going down.
  *	- skb->sk == NULL.
- *      - skb->oob == true.
  */
 int evl_net_transmit(struct sk_buff *skb) /* oob or in-band */
 {
@@ -172,18 +217,12 @@ int evl_net_transmit(struct sk_buff *skb) /* oob or in-band */
 	if (EVL_WARN_ON(NET, !dev))
 		return -EINVAL;
 
-	if (EVL_WARN_ON(NET, is_vlan_dev(dev)))
-		return -EINVAL;
-
 	if (EVL_WARN_ON(NET, skb->sk))
 		return -EINVAL;
 
-	/*
-	 * Only packets obtained from the per-device oob pool are
-	 * allowed to flow through this interface.
-	 */
-	if (EVL_WARN_ON(NET, !skb->oob))
-		return -EINVAL;
+	timestamp_at_sched(skb);
+
+	skb_mark_not_on_list(skb);
 
 	if (netdev_is_oob_capable(dev))
 		return xmit_oob(dev, skb);
@@ -202,9 +241,10 @@ int evl_net_transmit(struct sk_buff *skb) /* oob or in-band */
 	 * Running oob but net device is not oob-capable, resort to
 	 * relaying the traffic to the in-band stage for enqueuing.
 	 * Dovetail does ensure that __raise_softirq_irqoff() is safe
-	 * to call from the oob stage, but we want the softirq to be
-	 * raised as soon as in-band resumes with interrupts enabled,
-	 * so we go through the irq_work indirection first.
+	 * to call from the oob stage provided hard irqs are off, but
+	 * we want the softirq to be raised as soon as in-band resumes
+	 * with interrupts enabled, so we go through the irq_work
+	 * indirection first.
 	 */
 	raw_spin_lock_irqsave(&rl->lock, flags);
 	kick = list_empty(&rl->queue);
@@ -217,28 +257,17 @@ int evl_net_transmit(struct sk_buff *skb) /* oob or in-band */
 	return 0;
 }
 
-/**
- *	netif_xmit_oob - send a network packet in out-of-band mode
- *
- *	Queue the packet for transmission from the out-of-band stage
- *	as low priority traffic. This hook is called by the enqueuing
- *	handler of the "sch_oob" in-band Qdisc for any packet sent to
- * 	an oob-capable interface, so that both in-band and out-of-band
- *	traffic is injected from our out-of-band Qdisc.
- *
- *	@skb the packet to transmit. Not linked to any upstream
- *	queue. We may take for granted that @skb->dev is valid and
- *	oob-capable. There will be no further routing of @skb, we only
- *	queue the packet to the oob queuing discipline we have for the
- *	oob-capable device.
- *
- *	Returns NET_XMIT_SUCCESS if the packet was successfully queued
- *	for transmission, NET_XMIT_DROP otherwise.
- */
-int netif_xmit_oob(struct sk_buff *skb) /* in-band */
+void netif_tx_lock_oob(struct netdev_queue *txq) /* oob or in-band */
 {
-	return xmit_oob(skb->dev, skb) ? NET_XMIT_DROP : NET_XMIT_SUCCESS;
+	evl_lock_stax(&txq->oob.tx_lock);
 }
+EXPORT_SYMBOL_GPL(netif_tx_lock_oob);
+
+void netif_tx_unlock_oob(struct netdev_queue *txq) /* oob or in-band */
+{
+	evl_unlock_stax(&txq->oob.tx_lock);
+}
+EXPORT_SYMBOL_GPL(netif_tx_unlock_oob);
 
 void __init evl_net_init_tx(void)
 {

@@ -12,16 +12,13 @@
 #include <linux/wait.h>
 #include <linux/log2.h>
 #include <linux/atomic.h>
-#include <evl/wait.h>
 #include <evl/thread.h>
-#include <evl/clock.h>
 #include <evl/xbuf.h>
-#include <evl/memory.h>
 #include <evl/factory.h>
 #include <evl/sched.h>
 #include <evl/poll.h>
 #include <evl/flag.h>
-#include <uapi/evl/xbuf.h>
+#include <uapi/evl/xbuf-abi.h>
 
 struct xbuf_ring {
 	void *bufmem;
@@ -365,7 +362,7 @@ static void inbound_signal_output(struct xbuf_ring *ring, bool sigpoll)
 	if (sigpoll)
 		evl_signal_poll_events(&xbuf->poll_head, POLLOUT|POLLWRNORM);
 
-	evl_raise_flag(&xbuf->ibnd.o_event);
+	evl_raise_flag_nosched(&xbuf->ibnd.o_event);
 }
 
 static ssize_t xbuf_read(struct file *filp, char __user *u_buf,

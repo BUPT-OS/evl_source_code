@@ -18,11 +18,9 @@
 #include <linux/vmalloc.h>
 #include <linux/uaccess.h>
 #include <evl/memory.h>
-#include <evl/factory.h>
+#include <evl/monitor.h>
 #include <evl/assert.h>
 #include <evl/init.h>
-#include <uapi/evl/thread.h>
-#include <uapi/evl/monitor.h>
 
 static unsigned long sysheap_size_arg;
 module_param_named(sysheap_size, sysheap_size_arg, ulong, 0444);
@@ -40,8 +38,7 @@ enum evl_heap_pgtype {
 	page_list =2
 };
 
-static inline u32 __always_inline
-gen_block_mask(int log2size)
+__always_inline static u32 gen_block_mask(int log2size)
 {
 	return -1U >> (32 - (EVL_HEAP_PAGE_SIZE >> log2size));
 }
@@ -84,7 +81,7 @@ static void mark_pages(struct evl_heap *heap,
 		enum evl_heap_pgtype type)
 {
 	while (nrpages-- > 0)
-		heap->pagemap[pg].type = type;
+		heap->pagemap[pg++].type = type;
 }
 
 #else
@@ -633,13 +630,13 @@ static int init_shared_heap(void)
 		CONFIG_EVL_NR_MONITORS *
 		sizeof(struct evl_monitor_state);
 	size = PAGE_ALIGN(size);
-	mem = kzalloc(size, GFP_KERNEL);
+	mem = vzalloc(size);
 	if (mem == NULL)
 		return -ENOMEM;
 
 	ret = evl_init_heap(&evl_shared_heap, mem, size);
 	if (ret) {
-		kfree(mem);
+		vfree(mem);
 		return ret;
 	}
 
@@ -653,7 +650,7 @@ static void cleanup_shared_heap(void)
 	void *membase = evl_get_heap_base(&evl_shared_heap);
 
 	evl_destroy_heap(&evl_shared_heap);
-	kfree(membase);
+	vfree(membase);
 }
 
 static int init_system_heap(void)

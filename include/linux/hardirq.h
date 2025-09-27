@@ -143,24 +143,19 @@ void irq_exit_rcu(void);
 		irq_pipeline_nmi_exit();			\
 	} while (0)
 
-static inline bool start_irq_flow(void)
-{
-	return !irqs_pipelined() || in_pipeline();
-}
-
 static inline bool on_pipeline_entry(void)
 {
 	return irqs_pipelined() && in_pipeline();
 }
 
-static inline bool in_hard_irq(void)
-{
-	return irqs_pipelined() ? in_pipeline() : in_hardirq();
-}
-
 static inline bool in_nonmaskable(void)
 {
-	return on_pipeline_entry() || in_nmi();
+	/*
+	 * From the standpoint of tne in-band stage, any oob activity
+	 * stands for a non-maskable event being handled (including
+	 * the pipeline entry context).
+	 */
+	return running_oob() || in_nmi();
 }
 
 #endif /* LINUX_HARDIRQ_H */

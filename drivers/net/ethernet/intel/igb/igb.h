@@ -18,12 +18,24 @@
 #include <linux/i2c-algo-bit.h>
 #include <linux/pci.h>
 #include <linux/mdio.h>
+#include <linux/irq_work.h>
 
 #include <net/xdp.h>
 
 struct igb_adapter;
 
 #define E1000_PCS_CFG_IGN_SD	1
+
+/* The ICR conditions we should process in-band via interrupt
+ * forwarding between execution stages (i.e. detected oob but handled
+ * in-band). */
+#define E1000_ICR_FORWARD_MASK					\
+	(E1000_ICR_DRSTA|E1000_ICR_DOUTSYNC|			\
+		E1000_ICR_RXSEQ|E1000_ICR_LSC|E1000_ICR_TS)
+
+#define E1000_ICR_OTHER_FORWARD_MASK				\
+	(E1000_ICR_DRSTA|E1000_ICR_DOUTSYNC|			\
+		E1000_ICR_VMMB|E1000_ICR_LSC|E1000_ICR_TS)
 
 /* Interrupt defines */
 #define IGB_START_ITR		648 /* ~6000 ints/sec */
@@ -34,11 +46,11 @@ struct igb_adapter;
 /* TX/RX descriptor defines */
 #define IGB_DEFAULT_TXD		256
 #define IGB_DEFAULT_TX_WORK	128
-#define IGB_MIN_TXD		80
+#define IGB_MIN_TXD		64
 #define IGB_MAX_TXD		4096
 
 #define IGB_DEFAULT_RXD		256
-#define IGB_MIN_RXD		80
+#define IGB_MIN_RXD		64
 #define IGB_MAX_RXD		4096
 
 #define IGB_DEFAULT_ITR		3 /* dynamic */
@@ -225,6 +237,9 @@ enum igb_tx_flags {
 	/* olinfo flags */
 	IGB_TX_FLAGS_IPV4	= 0x10,
 	IGB_TX_FLAGS_CSUM	= 0x20,
+
+	/* oob management flags */
+	IGB_TX_OOB		= 0x40,
 };
 
 /* VLAN info */
@@ -288,6 +303,18 @@ struct igb_rx_buffer {
 	__u16 pagecnt_bias;
 };
 
+struct igb_inband_work {
+	struct igb_ring *ring;
+	dma_addr_t dma;
+	union {
+		struct {
+			struct page *page;
+			__u16 pagecnt_bias;
+		};
+		unsigned int len;
+	};
+};
+
 struct igb_tx_queue_stats {
 	u64 packets;
 	u64 bytes;
@@ -326,6 +353,11 @@ struct igb_ring {
 	void __iomem *tail;		/* pointer to ring tail register */
 	dma_addr_t dma;			/* phys address of the ring */
 	unsigned int  size;		/* length of desc. ring in bytes */
+#ifdef CONFIG_IGB_OOB
+	struct page_pool *rx_oob_pool;
+	struct igb_inband_work *inband_flush;
+	struct irq_work inband_irq_work;
+#endif
 
 	u16 count;			/* number of desc. in the ring */
 	u8 queue_index;			/* logical index of the ring*/
@@ -341,6 +373,10 @@ struct igb_ring {
 	u16 next_to_clean;
 	u16 next_to_use;
 	u16 next_to_alloc;
+#ifdef CONFIG_IGB_OOB
+	u16 next_to_defer;
+	u16 next_to_flush;
+#endif
 
 	union {
 		/* TX */
@@ -560,6 +596,11 @@ struct igb_adapter {
 	int num_rx_queues;
 	struct igb_ring *rx_ring[16];
 
+#ifdef CONFIG_IGB_OOB
+	u32 cached_icr;
+	u32 cached_tsicr;
+#endif
+
 	u32 max_frame_size;
 	u32 min_frame_size;
 
@@ -623,7 +664,7 @@ struct igb_adapter {
 	unsigned long last_rx_ptp_check;
 	unsigned long last_rx_timestamp;
 	unsigned int ptp_flags;
-	spinlock_t tmreg_lock;
+	hard_spinlock_t tmreg_lock;
 	struct cyclecounter cc;
 	struct timecounter tc;
 	u32 tx_hwtstamp_timeouts;
@@ -637,7 +678,7 @@ struct igb_adapter {
 		struct timespec64 period;
 	} perout[IGB_N_PEROUT];
 
-	char fw_version[32];
+	char fw_version[48];
 #ifdef CONFIG_IGB_HWMON
 	struct hwmon_buff *igb_hwmon_buff;
 	bool ets;
@@ -795,6 +836,26 @@ static inline s32 igb_get_phy_info(struct e1000_hw *hw)
 static inline struct netdev_queue *txring_txq(const struct igb_ring *tx_ring)
 {
 	return netdev_get_tx_queue(tx_ring->netdev, tx_ring->queue_index);
+}
+
+/*
+ * Check whether oob support is compiled in for the IGB driver. This
+ * tells nothing about the current execution stage, or whether oob
+ * diversion is ongoing for any IGB device.
+ */
+static inline bool igb_net_oob(void)
+{
+	return IS_ENABLED(CONFIG_IGB_OOB);
+}
+
+/*
+ * Check whether the caller is running on the out-of-band stage, with
+ * the precondition that oob support is compiled in for the IGB
+ * driver.
+ */
+static inline bool igb_running_oob(void)
+{
+	return igb_net_oob() && running_oob();
 }
 
 int igb_add_filter(struct igb_adapter *adapter,

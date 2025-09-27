@@ -3,16 +3,18 @@
  *
  * Copyright (C) 2016 Philippe Gerum  <rpm@xenomai.org>.
  */
-#include <linux/kernel.h>
-#include <linux/sched.h>
-#include <linux/interrupt.h>
-#include <linux/irq.h>
-#include <linux/irqdomain.h>
-#include <linux/irq_pipeline.h>
-#include <linux/irq_work.h>
-#include <linux/jhash.h>
+#include <linux/bottom_half.h>
 #include <linux/debug_locks.h>
 #include <linux/dovetail.h>
+#include <linux/interrupt.h>
+#include <linux/irq.h>
+#include <linux/irq_pipeline.h>
+#include <linux/irq_work.h>
+#include <linux/irqdomain.h>
+#include <linux/jhash.h>
+#include <linux/kernel.h>
+#include <linux/sched.h>
+#include <linux/smp.h>
 #include <dovetail/irq.h>
 #include <trace/events/irq.h>
 #include "internals.h"
@@ -42,10 +44,20 @@ EXPORT_SYMBOL_GPL(irq_pipeline_active);
 
 #define IRQ_L1_MAPSZ	BITS_PER_LONG
 #define IRQ_L2_MAPSZ	(BITS_PER_LONG * BITS_PER_LONG)
-#define IRQ_FLAT_MAPSZ	DIV_ROUND_UP(IRQ_BITMAP_BITS, BITS_PER_LONG)
+#ifdef CONFIG_SPARSE_IRQ
+/*
+ * CAUTION: In sparse mode, we provision for up to 16k distinct
+ * interrupts in addition to NR_IRQS as we currently need a static
+ * bitmap to mark pending events.
+ */
+#define MAX_PIPELINED_IRQS	(NR_IRQS + 16384)
+#else
+#define MAX_PIPELINED_IRQS	NR_IRQS
+#endif
+#define IRQ_FLAT_MAPSZ	DIV_ROUND_UP(MAX_PIPELINED_IRQS, BITS_PER_LONG)
 
 #if IRQ_FLAT_MAPSZ > IRQ_L2_MAPSZ
-#define __IRQ_STAGE_MAP_LEVELS	4	/* up to 4/16M vectors */
+#define __IRQ_STAGE_MAP_LEVELS	4	/* up to 4/16M vectors on 32/64bit arch */
 #elif IRQ_FLAT_MAPSZ > IRQ_L1_MAPSZ
 #define __IRQ_STAGE_MAP_LEVELS	3	/* up to 64/256M vectors */
 #else
@@ -78,6 +90,16 @@ DEFINE_PER_CPU(struct irq_pipeline_data, irq_pipeline) = {
 		},
 	},
 };
+
+struct pipeline_percpu_data { };
+static DEFINE_PER_CPU(struct pipeline_percpu_data, pipeline_percpu_data);
+
+static irqreturn_t smp_call_function_ipi_handler(int irq, void *dev_id)
+{
+	smp_flush_oob_call_function_queue();
+
+	return IRQ_HANDLED;
+}
 
 #else /* !CONFIG_SMP */
 
@@ -128,57 +150,17 @@ static struct irq_domain_ops sirq_domain_ops = {
 	.map	= sirq_map,
 };
 
-#ifdef CONFIG_SPARSE_IRQ
-/*
- * The performances of the radix tree in sparse mode are really ugly
- * under mm stress on some hw, use a local descriptor cache to ease
- * the pain.
- */
-#define DESC_CACHE_SZ  128
-
-static struct irq_desc *desc_cache[DESC_CACHE_SZ] __cacheline_aligned;
-
-static inline u32 hash_irq(unsigned int irq)
-{
-	return jhash(&irq, sizeof(irq), irq) % DESC_CACHE_SZ;
-}
-
-static __always_inline
-struct irq_desc *irq_to_cached_desc(unsigned int irq)
-{
-	int hval = hash_irq(irq);
-	struct irq_desc *desc = desc_cache[hval];
-
-	if (unlikely(desc == NULL || irq_desc_get_irq(desc) != irq)) {
-		desc = irq_to_desc(irq);
-		desc_cache[hval] = desc;
-	}
-
-	return desc;
-}
-
-void uncache_irq_desc(unsigned int irq)
-{
-	int hval = hash_irq(irq);
-
-	desc_cache[hval] = NULL;
-}
-
-#else
-
-static struct irq_desc *irq_to_cached_desc(unsigned int irq)
-{
-	return irq_to_desc(irq);
-}
-
-#endif
-
 /**
  *	handle_synthetic_irq -  synthetic irq handler
  *	@desc:	the interrupt description structure for this irq
  *
  *	Handles synthetic interrupts flowing down the IRQ pipeline
- *	with per-CPU semantics.
+ *	with per-CPU semantics (accessing desc needs no locking).
+ *
+ *	Since the SIPIC cannot be stacked on top of a parent irqchip,
+ * 	we can bypass most of the IRQS_DEFERRED logic, testing
+ * 	on_pipeline_entry() directly - although we should still clear
+ * 	IRQS_DEFERRED when in-band since handle_oob_irq() raises it.
  *
  *      CAUTION: synthetic IRQs may be used to map hardware-generated
  *      events (e.g. IPIs or traps), we must start handling them as
@@ -195,6 +177,12 @@ void handle_synthetic_irq(struct irq_desc *desc)
 		handle_oob_irq(desc);
 		return;
 	}
+
+	if (desc->istate & IRQS_DEFERRED)
+		irq_clear_deferral(desc);
+
+	if (desc->istate & IRQS_FORWARDED)
+		irq_clear_forward(desc);
 
 	action = desc->action;
 	if (action == NULL) {
@@ -456,6 +444,34 @@ noinstr bool stage_disabled(void)
 EXPORT_SYMBOL_GPL(stage_disabled);
 
 /**
+ *	stage_disabled_flags - test a particular interrupt state
+ *
+ *	Returns non-zero if interrupts are marked as disabled in the
+ *	interrupt state, zero otherwise.
+ *      In other words, returns non-zero either if:
+ *      - interrupts are disabled for the OOB context (i.e. hard disabled),
+ *      - inband interrupts are stalled (meaning that we were running in-band
+ *        when building that interrupt state).
+ *
+ *      CAUTION: in general, you cannot infer from an interrupt state
+ *      value which stage was active at the time such state was
+ *      snapshot. However, as mentioned earlier, you may assume that
+ *      the in-band stage can be reported as stalled only when current
+ *      though, since this is guaranteed by the implementation of
+ *      test_and_lock_stage().
+ */
+noinstr bool stage_disabled_flags(unsigned long irqstate, bool *stalled)
+{
+	unsigned long flags;
+	int _stalled;
+
+	flags = irqs_split_flags(irqstate, &_stalled);
+	*stalled = _stalled;
+	return hard_irqs_disabled_flags(flags) || stalled;
+}
+EXPORT_SYMBOL_GPL(stage_disabled_flags);
+
+/**
  *	test_and_lock_stage - test and disable interrupts for the current stage
  *	@irqsoff:	Pointer to boolean denoting stage_disabled()
  *                      on entry
@@ -581,7 +597,7 @@ static inline bool irq_post_check(struct irq_stage *stage, unsigned int irq)
 				"hard irqs on posting IRQ%u to %s\n",
 				irq, stage->name))
 			return true;
-		if (WARN_ONCE(irq >= IRQ_BITMAP_BITS,
+		if (WARN_ONCE(irq >= MAX_PIPELINED_IRQS,
 				"cannot post invalid IRQ%u to %s\n",
 				irq, stage->name))
 			return true;
@@ -763,9 +779,9 @@ static inline int pull_next_irq(struct irq_stage_data *p)
  *	hard_preempt_disable - Disable preemption the hard way
  *
  *      Disable hardware interrupts in the CPU, and disable preemption
- *      if currently running in-band code on the inband stage.
+ *      as well if currently running on the inband stage.
  *
- *      Return the hardware interrupt state.
+ *      Return the hardware interrupt state on entry.
  */
 unsigned long hard_preempt_disable(void)
 {
@@ -781,8 +797,8 @@ EXPORT_SYMBOL_GPL(hard_preempt_disable);
 /**
  *	hard_preempt_enable - Enable preemption the hard way
  *
- *      Enable preemption if currently running in-band code on the
- *      inband stage, restoring the hardware interrupt state in the CPU.
+ *      Enable preemption if currently running on the inband stage,
+ *      restoring the hardware interrupt state in the CPU as well.
  *      The per-CPU log is not played for the oob stage.
  */
 void hard_preempt_enable(unsigned long flags)
@@ -792,10 +808,44 @@ void hard_preempt_enable(unsigned long flags)
 		hard_local_irq_restore(flags);
 		if (!hard_irqs_disabled_flags(flags))
 			preempt_check_resched();
-	} else
+	} else {
 		hard_local_irq_restore(flags);
+	}
 }
 EXPORT_SYMBOL_GPL(hard_preempt_enable);
+
+/**
+ *	hard_bh_disable - Disable bottom-halves and hard irqs
+ *
+ *      Disable BH if currently running on the inband stage, then hard
+ *      irqs.
+ *
+ *      Return the hardware interrupt state on entry.
+ */
+unsigned long hard_bh_disable(void)
+{
+	if (running_inband())
+		local_bh_disable();
+
+	return hard_local_irq_save();
+}
+EXPORT_SYMBOL_GPL(hard_bh_disable);
+
+/**
+ *	hard_bh_enable - Restore hard irqs then enable bottom-halves
+ *
+ *      Restore the hardware interrupt state in the CPU, then enable
+ *      BH if currently running on the inband stage. The per-CPU log
+ *      is not played for the oob stage.
+ */
+void hard_bh_enable(unsigned long flags)
+{
+	hard_local_irq_restore(flags);
+
+	if (running_inband())
+		local_bh_enable();
+}
+EXPORT_SYMBOL_GPL(hard_bh_enable);
 
 static void handle_unexpected_irq(struct irq_desc *desc, irqreturn_t ret)
 {
@@ -808,8 +858,8 @@ static void handle_unexpected_irq(struct irq_desc *desc, irqreturn_t ret)
 	 * detection logic is as follows:
 	 *
 	 * - check and complain about any bogus return value from a
-	 * out-of-band IRQ handler: we only allow IRQ_HANDLED and
-	 * IRQ_NONE from those routines.
+	 * out-of-band IRQ handler: we only allow IRQ_HANDLED,
+	 * IRQ_FORWARD or IRQ_NONE from those routines.
 	 *
 	 * - filter out spurious IRQs which may have been due to bus
 	 * asynchronicity, those tend to happen infrequently and
@@ -829,10 +879,10 @@ static void handle_unexpected_irq(struct irq_desc *desc, irqreturn_t ret)
 		     !raw_spin_is_locked(&desc->lock));
 
 	if (ret != IRQ_NONE) {
-		printk(KERN_ERR "out-of-band irq event %d: bogus return value %x\n",
+		printk(KERN_ERR "out-of-band IRQ%d: bogus return value %#x\n",
 		       irq, ret);
 		for_each_action_of_desc(desc, action)
-			printk(KERN_ERR "[<%p>] %pf",
+			printk(KERN_ERR "[<%px>] %pS",
 			       action->handler, action->handler);
 		printk(KERN_CONT "\n");
 		return;
@@ -898,10 +948,19 @@ static void do_oob_irq(struct irq_desc *desc)
 		raw_spin_lock(&desc->lock);
 		irqd_clear(&desc->irq_data, IRQD_IRQ_INPROGRESS);
 	}
+	/*
+	 * The oob handler might request to forward the event
+	 * downstream to the in-band stage. Post the event to the
+	 * in-band log, marking the descriptor accordingly if so.
+	 */
+	if (ret & IRQ_FORWARD) {
+		irq_post_stage(&inband_stage, irq);
+		desc->istate |= IRQS_FORWARDED;
+	}
 done:
 	incr_irq_kstat(desc);
 
-	if (likely(ret & IRQ_HANDLED)) {
+	if (likely(ret & (IRQ_HANDLED|IRQ_FORWARD))) {
 		desc->irqs_unhandled = 0;
 		return;
 	}
@@ -928,7 +987,8 @@ static inline bool is_active_edge_event(struct irq_desc *desc)
 		!irqd_irq_disabled(&desc->irq_data);
 }
 
-bool handle_oob_irq(struct irq_desc *desc) /* hardirqs off */
+/* desc->lock held unless per-CPU, hardirqs off. */
+bool handle_oob_irq(struct irq_desc *desc)
 {
 	struct irq_stage_data *oobd = this_oob_staged();
 	unsigned int irq = irq_desc_get_irq(desc);
@@ -954,6 +1014,7 @@ bool handle_oob_irq(struct irq_desc *desc) /* hardirqs off */
 	 * whether an out-of-band interrupt was delivered.
 	 */
 	if (!oob_stage_present() || !irq_settings_is_oob(desc)) {
+		desc->istate |= IRQS_DEFERRED;
 		irq_post_stage(&inband_stage, irq);
 		return false;
 	}
@@ -1214,7 +1275,7 @@ int irq_inject_pipeline(unsigned int irq)
 	struct irq_desc *desc;
 	unsigned long flags;
 
-	desc = irq_to_cached_desc(irq);
+	desc = irq_to_desc(irq);
 	if (desc == NULL)
 		return -EINVAL;
 
@@ -1291,7 +1352,7 @@ respin:
 		 */
 		barrier();
 
-		desc = irq_to_cached_desc(irq);
+		desc = irq_to_desc(irq);
 
 		if (stage == &inband_stage) {
 			hard_local_irq_enable();
@@ -1461,6 +1522,30 @@ out:
 }
 EXPORT_SYMBOL_GPL(run_oob_call);
 
+struct up_oob_call_tramp {
+	smp_call_func_t func;
+	void *info;
+};
+
+static int __up_oob_call(void *arg)
+{
+	struct up_oob_call_tramp *tramp = arg;
+
+	tramp->func(tramp->info);
+
+	return 0;
+}
+
+/*
+ * up_oob_call_tramp - run_oob_call() trampoline to smp function calls
+ * for uniprocessor configuration.
+ */
+int up_oob_call(smp_call_func_t func, void *info)
+{
+	struct up_oob_call_tramp tramp = { .func = func, .info = info };
+	return run_oob_call(__up_oob_call, &tramp);
+}
+
 int enable_oob_stage(const char *name)
 {
 	struct irq_event_map *map;
@@ -1537,6 +1622,46 @@ noinstr void irq_pipeline_nmi_exit(void)
 }
 EXPORT_SYMBOL(irq_pipeline_nmi_exit);
 
+/**
+ *	irq_pipeline_can_idle - Prepare for idling the CPU.
+ *
+ *	Flush the in-band interrupt log before the caller idles, so
+ *	that no event lingers before we actually wait for the next
+ *	IRQ. If some IRQ events were pending, ask the caller to
+ *	abort the idling process since we might have to reschedule.
+ *	On entry:
+ *
+ *	- we must be running on the in-band stage
+ *      - hard irqs must be enabled
+ *	- the in-band stage must be stalled
+ *
+ *	Returns @true if the caller may proceed with idling, @false
+ *	otherwise. If @true, hard irqs are left disabled so that no
+ *	event might sneak in until the caller actually
+ *	idles. Otherwise, the interrupt log is synchronized before
+ *	leaving this routine with hard irqs on.
+ */
+bool irq_pipeline_can_idle(void)
+{
+	if (irq_pipeline_debug()) {
+		WARN_ON_ONCE(running_oob());
+		WARN_ON_ONCE(hard_irqs_disabled());
+		WARN_ON_ONCE(!irqs_disabled());
+	}
+
+	hard_local_irq_disable();
+
+	if (stage_irqs_pending(this_inband_staged())) {
+		unstall_inband_nocheck();
+		synchronize_pipeline();
+		stall_inband_nocheck();
+		trace_hardirqs_off();
+		return false;
+	}
+
+	return true;
+}
+
 bool __weak irq_cpuidle_control(struct cpuidle_device *dev,
 				struct cpuidle_state *state)
 {
@@ -1555,34 +1680,27 @@ bool __weak irq_cpuidle_control(struct cpuidle_device *dev,
  *	@dev: CPUIDLE device
  *	@state: CPUIDLE state to be entered
  *
- *	Flush the in-band interrupt log before the caller idles, so
- *	that no event lingers before we actually wait for the next
- *	IRQ, in which case we ask the caller to abort the idling
- *	process altogether. The companion core is also given the
- *	opportunity to block the idling process by having
- *	irq_cpuidle_control() return @false.
+ *	This routine first checks for pending interrupts in the
+ *	in-band log, then allow the companion core to block the idling
+ *	request if it sees fit with respect to its own requirements.
  *
- *	Returns @true if caller may proceed with idling, @false
- *	otherwise. The in-band log is guaranteed empty on return, hard
- *	irqs left off so that no event might sneak in until the caller
- *	actually idles.
- */
+ *	Returns @true if the caller may proceed with idling, @false
+ *	otherwise. Either way, hard irqs are left disabled.
+  */
 bool irq_cpuidle_enter(struct cpuidle_device *dev,
 		       struct cpuidle_state *state)
 {
-	WARN_ON_ONCE(irq_pipeline_debug() && !irqs_disabled());
+	bool ret;
 
-	hard_local_irq_disable();
-
-	if (stage_irqs_pending(this_inband_staged())) {
-		unstall_inband_nocheck();
-		synchronize_pipeline();
-		stall_inband_nocheck();
-		trace_hardirqs_off();
+	ret = irq_pipeline_can_idle();
+	irq_pipeline_idling_checks();
+	if (!ret)
 		return false;
-	}
 
-	return irq_cpuidle_control(dev, state);
+	ret = irq_cpuidle_control(dev, state);
+	irq_pipeline_idling_checks();
+
+	return ret;
 }
 
 static unsigned int inband_work_sirq;
@@ -1763,6 +1881,23 @@ void __init irq_pipeline_init(void)
 	 * arch-specific code for enabling the pipeline.
 	 */
 	arch_irq_pipeline_init();
+
+#ifdef CONFIG_SMP
+	/*
+	 * Hook the remote call IPI which smp_call_function_oob()
+	 * sends to notify remote CPUs of pending work.
+	 *
+	 * CAUTION: the base interrupt controller of a uniprocessor
+	 * machine provides no IPI: skip the operation if the hardware
+	 * cannot support multiple CPUs.
+	 */
+	if (num_possible_cpus() > 1 &&
+		__request_percpu_irq(CALL_FUNCTION_OOB_IPI,
+				smp_call_function_ipi_handler,
+				IRQF_OOB, "out-of-band function call IPI",
+				&pipeline_percpu_data))
+		WARN_ON(1);
+#endif
 
 	irq_pipeline_active = true;
 

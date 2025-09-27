@@ -73,7 +73,8 @@ static inline void syscall_get_arguments(struct task_struct *task,
 	memcpy(args, &regs->regs[1], 5 * sizeof(args[0]));
 }
 
-static inline unsigned long syscall_get_arg0(struct pt_regs *regs)
+static inline unsigned long syscall_get_arg0(struct task_struct *task,
+					     struct pt_regs *regs)
 {
 	return regs->orig_x0;
 }
@@ -89,5 +90,8 @@ static inline int syscall_get_arch(struct task_struct *task)
 
 	return AUDIT_ARCH_AARCH64;
 }
+
+int syscall_trace_enter(struct pt_regs *regs);
+void syscall_trace_exit(struct pt_regs *regs);
 
 #endif	/* __ASM_SYSCALL_H */

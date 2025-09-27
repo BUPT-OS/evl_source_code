@@ -117,7 +117,7 @@ const struct vdso_data *__arch_get_timens_vdso_data(const struct vdso_data *vd)
 
 #include <uapi/linux/fcntl.h>
 
-extern struct vdso_priv _vdso_priv; /* vdso.lds.S */
+extern struct vdso_priv _vdso_priv __attribute__((visibility("hidden"))); /* vdso.lds.S */
 
 static __always_inline struct vdso_priv *__arch_get_vdso_priv(void)
 {

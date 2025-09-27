@@ -14,6 +14,8 @@
 #include <asm/mshyperv.h>
 #include <asm/idtentry.h>
 
+void (*pipeline_hv_callback_fn)(struct pt_regs *regs) = NULL;
+
 static struct irq_domain *sipic_domain;
 
 static void sipic_irq_noop(struct irq_data *data) { }
@@ -32,7 +34,7 @@ static struct irq_chip sipic_chip = {
 	.flags		= IRQCHIP_PIPELINE_SAFE | IRQCHIP_SKIP_SET_WAKE,
 };
 
-void handle_apic_irq(struct irq_desc *desc)
+static void handle_apic_irq(struct irq_desc *desc)
 {
 	if (WARN_ON_ONCE(irq_pipeline_debug() && !on_pipeline_entry()))
 		return;
@@ -48,17 +50,10 @@ void handle_apic_irq(struct irq_desc *desc)
 	 * APIC events, then pipeline the corresponding interrupt from
 	 * our synthetic controller chip (SIPIC).
 	 */
-	__ack_APIC_irq();
+	__apic_eoi();
 
 	handle_oob_irq(desc);
 }
-
-void irq_send_oob_ipi(unsigned int ipi,
-		const struct cpumask *cpumask)
-{
-	apic->send_IPI_mask_allbutself(cpumask,	apicm_irq_vector(ipi));
-}
-EXPORT_SYMBOL_GPL(irq_send_oob_ipi);
 
 static irqentry_state_t pipeline_enter_rcu(void)
 {
@@ -81,6 +76,11 @@ static void pipeline_exit_rcu(irqentry_state_t state)
 {
 	if (state.exit_rcu)
 		ct_irq_exit();
+}
+
+static void pipeline_hv_callback(struct pt_regs *regs)
+{
+	pipeline_hv_callback_fn(regs);
 }
 
 static void do_sysvec_inband(struct irq_desc *desc, struct pt_regs *regs)
@@ -115,6 +115,8 @@ static void do_sysvec_inband(struct irq_desc *desc, struct pt_regs *regs)
 	 * which is ugly. But the irqstack code makes assumptions we
 	 * don't want to break.
 	 */
+
+	irq_clear_deferral(desc);
 
 	switch (vector) {
 #ifdef CONFIG_SMP
@@ -155,12 +157,9 @@ static void do_sysvec_inband(struct irq_desc *desc, struct pt_regs *regs)
 					regs);
 		break;
 #endif
-#ifdef CONFIG_ACRN_GUEST
 	case HYPERVISOR_CALLBACK_VECTOR:
-		run_sysvec_on_irqstack_cond(__sysvec_acrn_hv_callback,
-					regs);
+		run_sysvec_on_irqstack_cond(pipeline_hv_callback, regs);
 		break;
-#endif
 	case LOCAL_TIMER_VECTOR:
 		run_sysvec_on_irqstack_cond(__sysvec_apic_timer_interrupt,
 					regs);
@@ -174,7 +173,6 @@ static void do_sysvec_inband(struct irq_desc *desc, struct pt_regs *regs)
 
 static void do_irq_inband(struct pt_regs *regs, u32 irq)
 {
-
 	struct irq_desc *desc = irq_to_desc(irq);
 
 	desc->handle_irq(desc);
@@ -207,7 +205,7 @@ void arch_do_IRQ_pipelined(struct irq_desc *desc)
 	pipeline_exit_rcu(state);
 }
 
-void arch_handle_irq(struct pt_regs *regs, u8 vector, bool irq_movable)
+static void arch_handle_irq(struct pt_regs *regs, u8 vector, bool irq_movable)
 {
 	struct pt_regs *old_regs = set_irq_regs(regs);
 	struct irq_desc *desc;
@@ -219,7 +217,7 @@ void arch_handle_irq(struct pt_regs *regs, u8 vector, bool irq_movable)
 	} else {
 		desc = __this_cpu_read(vector_irq[vector]);
 		if (unlikely(IS_ERR_OR_NULL(desc))) {
-			__ack_APIC_irq();
+			__apic_eoi();
 
 			if (desc == VECTOR_UNUSED) {
 				pr_emerg_ratelimited("%s: %d.%u No irq handler for vector\n",
@@ -338,55 +336,19 @@ static void create_x86_apic_domain(void)
 
 #ifdef CONFIG_SMP
 
-DEFINE_IDTENTRY_SYSVEC_PIPELINED(RESCHEDULE_OOB_VECTOR,
-				 sysvec_reschedule_oob_ipi)
-{ /* In-band handler is unused. */ }
-
 DEFINE_IDTENTRY_SYSVEC_PIPELINED(TIMER_OOB_VECTOR,
 				 sysvec_timer_oob_ipi)
 { /* In-band handler is unused. */ }
 
-void handle_irq_move_cleanup(struct irq_desc *desc)
-{
-	if (on_pipeline_entry()) {
-		/* 1. on receipt from hardware. */
-		__ack_APIC_irq();
-		handle_oob_irq(desc);
-	} else {
-		/* 2. in-band delivery. */
-		__sysvec_irq_move_cleanup(NULL);
-	}
-}
+DEFINE_IDTENTRY_SYSVEC_PIPELINED(RESCHEDULE_OOB_VECTOR,
+				 sysvec_reschedule_oob_ipi)
+{ /* In-band handler is unused. */ }
 
-static void smp_setup(void)
-{
-	int irq;
+DEFINE_IDTENTRY_SYSVEC_PIPELINED(CALL_FUNCTION_OOB_VECTOR,
+				 sysvec_call_function_oob_ipi)
+{ /* In-band handler is unused. */ }
 
-	/*
-	 * The IRQ cleanup event must be pipelined to the inband
-	 * stage, so we need a valid IRQ descriptor for it. Since we
-	 * still are in the early boot stage on CPU0, we ask for a 1:1
-	 * mapping between the vector number and IRQ number, to make
-	 * things easier for us later on.
-	 */
-	irq = irq_alloc_desc_at(IRQ_MOVE_CLEANUP_VECTOR, 0);
-	WARN_ON(IRQ_MOVE_CLEANUP_VECTOR != irq);
-	/*
-	 * Set up the vector_irq[] mapping array for the boot CPU,
-	 * other CPUs will copy this entry when their APIC is going
-	 * online (see lapic_online()).
-	 */
-	per_cpu(vector_irq, 0)[irq] = irq_to_desc(irq);
-
-	irq_set_chip_and_handler(irq, &dummy_irq_chip,
-				handle_irq_move_cleanup);
-}
-
-#else
-
-static void smp_setup(void) { }
-
-#endif
+#endif	/* !CONFIG_SMP */
 
 void __init arch_irq_pipeline_init(void)
 {
@@ -397,6 +359,4 @@ void __init arch_irq_pipeline_init(void)
 	 * the corresponding sirq is injected into the pipeline.
 	 */
 	create_x86_apic_domain();
-
-	smp_setup();
 }

@@ -22,6 +22,7 @@
 #include <linux/timecounter.h>
 #include <dt-bindings/firmware/imx/rsrc.h>
 #include <linux/firmware/imx/sci.h>
+#include <net/xdp.h>
 
 #if defined(CONFIG_M523x) || defined(CONFIG_M527x) || defined(CONFIG_M528x) || \
     defined(CONFIG_M520x) || defined(CONFIG_M532x) || defined(CONFIG_ARM) || \
@@ -348,7 +349,6 @@ struct bufdesc_ex {
  */
 
 #define FEC_ENET_XDP_HEADROOM	(XDP_PACKET_HEADROOM)
-
 #define FEC_ENET_RX_PAGES	256
 #define FEC_ENET_RX_FRSIZE	(PAGE_SIZE - FEC_ENET_XDP_HEADROOM \
 		- SKB_DATA_ALIGN(sizeof(struct skb_shared_info)))
@@ -356,7 +356,7 @@ struct bufdesc_ex {
 #define RX_RING_SIZE		(FEC_ENET_RX_FRPPG * FEC_ENET_RX_PAGES)
 #define FEC_ENET_TX_FRSIZE	2048
 #define FEC_ENET_TX_FRPPG	(PAGE_SIZE / FEC_ENET_TX_FRSIZE)
-#define TX_RING_SIZE		512	/* Must be power of two */
+#define TX_RING_SIZE		1024	/* Must be power of two */
 #define TX_RING_MOD_MASK	511	/*   for this to work */
 
 #define BD_ENET_RX_INT		0x00800000
@@ -508,6 +508,11 @@ struct bufdesc_ex {
 /* i.MX6Q adds pm_qos support */
 #define FEC_QUIRK_HAS_PMQOS			BIT(23)
 
+/* Not all FEC hardware block MDIOs support accesses in C45 mode.
+ * Older blocks in the ColdFire parts do not support it.
+ */
+#define FEC_QUIRK_HAS_MDIO_C45		BIT(24)
+
 struct bufdesc_prop {
 	int qid;
 	/* Address of Rx and Tx buffers */
@@ -527,10 +532,50 @@ struct fec_enet_priv_txrx_info {
 	struct  sk_buff *skb;
 };
 
+enum {
+	RX_XDP_REDIRECT = 0,
+	RX_XDP_PASS,
+	RX_XDP_DROP,
+	RX_XDP_TX,
+	RX_XDP_TX_ERRORS,
+	TX_XDP_XMIT,
+	TX_XDP_XMIT_ERRORS,
+
+	/* The following must be the last one */
+	XDP_STATS_TOTAL,
+};
+
+enum fec_txbuf_type {
+	FEC_TXBUF_T_SKB,
+	FEC_TXBUF_T_XDP_NDO,
+	FEC_TXBUF_T_XDP_TX,
+};
+
+struct fec_tx_buffer {
+	void *buf_p;
+	enum fec_txbuf_type type;
+};
+
+#ifdef CONFIG_FEC_OOB
+struct fec_enet_priv_tx_q;
+
+struct fec_inband_work {
+	dma_addr_t addr;
+	struct device *dev;
+	unsigned int size;
+};
+#endif
+
 struct fec_enet_priv_tx_q {
 	struct bufdesc_prop bd;
 	unsigned char *tx_bounce[TX_RING_SIZE];
-	struct  sk_buff *tx_skbuff[TX_RING_SIZE];
+	struct fec_tx_buffer tx_buf[TX_RING_SIZE];
+#ifdef CONFIG_FEC_OOB
+	struct fec_inband_work inband_flush[TX_RING_SIZE];
+	struct irq_work inband_irq_work;
+	int next_to_defer;
+	int next_to_flush;
+#endif
 
 	unsigned short tx_stop_threshold;
 	unsigned short tx_wake_threshold;
@@ -547,6 +592,7 @@ struct fec_enet_priv_rx_q {
 	/* page_pool */
 	struct page_pool *page_pool;
 	struct xdp_rxq_info xdp_rxq;
+	u32 stats[XDP_STATS_TOTAL];
 
 	/* rx queue number, in the range 0-7 */
 	u8 id;
@@ -620,12 +666,9 @@ struct fec_enet_private {
 
 	struct ptp_clock *ptp_clock;
 	struct ptp_clock_info ptp_caps;
-	unsigned long last_overflow_check;
 	spinlock_t tmreg_lock;
 	struct cyclecounter cc;
 	struct timecounter tc;
-	int rx_hwtstamp_filter;
-	u32 base_incval;
 	u32 cycle_speed;
 	int hwts_rx_en;
 	int hwts_tx_en;
@@ -645,10 +688,8 @@ struct fec_enet_private {
 	unsigned int itr_clk_rate;
 
 	/* tx lpi eee mode */
-	struct ethtool_eee eee;
+	struct ethtool_keee eee;
 	unsigned int clk_ref_rate;
-
-	u32 rx_copybreak;
 
 	/* ptp clock period in ns*/
 	unsigned int ptp_inc;
@@ -658,18 +699,62 @@ struct fec_enet_private {
 	unsigned int reload_period;
 	int pps_enable;
 	unsigned int next_counter;
+	struct hrtimer perout_timer;
+	u64 perout_stime;
 
 	struct imx_sc_ipc *ipc_handle;
+
+	/* XDP BPF Program */
+	struct bpf_prog *xdp_prog;
+
+	struct {
+		int pps_enable;
+		u64 ns_sys, ns_phc;
+		u32 at_corr;
+		u8 at_inc_corr;
+	} ptp_saved_state;
 
 	u64 ethtool_stats[];
 };
 
+/*
+ * Check whether oob support is compiled in for the FEC driver. This
+ * tells nothing about the current execution stage, or whether oob
+ * diversion is ongoing for any FEC device.
+ */
+static inline bool fec_net_oob(void)
+{
+	return IS_ENABLED(CONFIG_FEC_OOB);
+}
+
+/*
+ * Check whether the caller is running on the out-of-band stage, with
+ * the precondition that oob support is compiled in for the FEC driver.
+ */
+static inline bool fec_running_oob(void)
+{
+	return fec_net_oob() && running_oob();
+}
+
+/*
+ * Check whether a FEC device is currently diverting packet to the
+ * out-of-band netstack. The compiler is given the opportunity to
+ * compile the whole thing out if either NET_OOB or FEC_OOB which
+ * depends on it are disabled.
+ */
+static inline bool fec_oob_enabled(struct fec_enet_private *fep)
+{
+	return IS_ENABLED(CONFIG_FEC_OOB) && netif_oob_diversion(fep->netdev);
+}
+
 void fec_ptp_init(struct platform_device *pdev, int irq_idx);
+void fec_ptp_restore_state(struct fec_enet_private *fep);
+void fec_ptp_save_state(struct fec_enet_private *fep);
 void fec_ptp_stop(struct platform_device *pdev);
 void fec_ptp_start_cyclecounter(struct net_device *ndev);
-void fec_ptp_disable_hwts(struct net_device *ndev);
-int fec_ptp_set(struct net_device *ndev, struct ifreq *ifr);
-int fec_ptp_get(struct net_device *ndev, struct ifreq *ifr);
+int fec_ptp_set(struct net_device *ndev, struct kernel_hwtstamp_config *config,
+		struct netlink_ext_ack *extack);
+void fec_ptp_get(struct net_device *ndev, struct kernel_hwtstamp_config *config);
 
 /****************************************************************************/
 #endif /* FEC_H */

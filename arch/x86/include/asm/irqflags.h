@@ -8,9 +8,6 @@
 
 #include <asm/nospec-branch.h>
 
-/* Provide __cpuidle; we can't safely include <linux/cpu.h> */
-#define __cpuidle __section(".cpuidle.text")
-
 /*
  * Interrupt control:
  */
@@ -54,6 +51,12 @@ static __always_inline void native_irq_enable(void)
 	asm volatile("sti": : :"memory");
 }
 
+static __always_inline void native_safe_halt(void)
+{
+	mds_idle_clear_cpu_buffers();
+	asm volatile("sti; hlt": : :"memory");
+}
+
 static inline unsigned long native_save_flags(void)
 {
 	return native_save_fl();
@@ -75,11 +78,6 @@ static __always_inline unsigned long native_irq_save(void)
 	return flags;
 }
 
-static __always_inline int native_irqs_disabled_flags(unsigned long flags)
-{
-	return !(flags & X86_EFLAGS_IF);
-}
-
 static __always_inline void native_irq_restore(unsigned long flags)
 {
 	/*
@@ -91,38 +89,47 @@ static __always_inline void native_irq_restore(unsigned long flags)
 	native_restore_fl(flags);
 }
 
+static __always_inline void native_halt(void)
+{
+	mds_idle_clear_cpu_buffers();
+	asm volatile("hlt": : :"memory");
+}
+
+static __always_inline int native_irqs_disabled_flags(unsigned long flags)
+{
+	return !(flags & X86_EFLAGS_IF);
+}
+
 static __always_inline bool native_irqs_disabled(void)
 {
 	unsigned long flags = native_save_flags();
 	return native_irqs_disabled_flags(flags);
 }
 
-static inline __cpuidle void native_safe_halt(void)
+static __always_inline unsigned long native_local_irq_save(void)
 {
-	mds_idle_clear_cpu_buffers();
-	asm volatile("sti; hlt": : :"memory");
+	unsigned long flags = native_save_fl();
+
+	native_irq_disable();
+
+	return flags;
 }
 
-static inline __cpuidle void native_halt(void)
+static __always_inline void native_local_irq_restore(unsigned long flags)
 {
-	mds_idle_clear_cpu_buffers();
-	asm volatile("hlt": : :"memory");
+	if (!native_irqs_disabled_flags(flags))
+		native_irq_enable();
 }
 
 #endif
 
-#ifdef CONFIG_PARAVIRT_XXL
-#include <asm/paravirt.h>
-#else
+#ifndef CONFIG_PARAVIRT
 #ifndef __ASSEMBLY__
-#include <linux/types.h>
-#include <asm/irq_pipeline.h>
-
 /*
  * Used in the idle loop; sti takes one instruction cycle
  * to complete:
  */
-static inline __cpuidle void arch_safe_halt(void)
+static __always_inline void arch_safe_halt(void)
 {
 	native_safe_halt();
 }
@@ -131,11 +138,19 @@ static inline __cpuidle void arch_safe_halt(void)
  * Used when interrupts are already enabled or to
  * shutdown the processor:
  */
-static inline __cpuidle void halt(void)
+static __always_inline void halt(void)
 {
 	native_halt();
 }
+#endif /* __ASSEMBLY__ */
+#endif /* CONFIG_PARAVIRT */
 
+#ifdef CONFIG_PARAVIRT_XXL
+#include <asm/paravirt.h>
+#else
+#ifndef __ASSEMBLY__
+#include <linux/types.h>
+#include <asm/irq_pipeline.h>
 #else
 
 #ifdef CONFIG_X86_64

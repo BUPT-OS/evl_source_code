@@ -7,20 +7,22 @@
 #include <linux/types.h>
 #include <linux/list.h>
 #include <linux/slab.h>
+#include <linux/wait.h>
+#include <linux/irq_work.h>
 #include <evl/thread.h>
-#include <evl/wait.h>
 #include <evl/mutex.h>
-#include <evl/clock.h>
-#include <evl/monitor.h>
 #include <evl/thread.h>
 #include <evl/memory.h>
-#include <evl/sched.h>
 #include <evl/factory.h>
-#include <evl/syscall.h>
+#include <evl/monitor.h>
 #include <evl/poll.h>
 #include <evl/uaccess.h>
-#include <uapi/evl/monitor.h>
 #include <trace/events/evl.h>
+
+static __always_inline  atomic_t *__ATOMIC32(__u32 *ptr)
+{
+	return (atomic_t *)ptr;
+}
 
 struct evl_monitor {
 	struct evl_element element;
@@ -34,17 +36,29 @@ struct evl_monitor {
 			hard_spinlock_t lock;
 		};
 		struct {
+			/* Out-of-band wait queue. */
 			struct evl_wait_queue wait_queue;
-			struct evl_monitor *gate; /* only valid during active wait. */
+			/* In-band wait queue (read side). */
+			wait_queue_head_t inband_wait_r;
+			/* In-band wait queue (write side). */
+			wait_queue_head_t inband_wait_w;
+			/* In-band wake up work (read side). */
+			struct irq_work inband_wake_r;
+			/* In-band wake up work (write side). */
+			struct irq_work inband_wake_w;
+			/* Gate (valid during active wait only). */
+			struct evl_monitor *gate;
+			/* Out-of-band poll head. */
 			struct evl_poll_head poll_head;
-			struct list_head next; /* in ->events */
+			/* in ->events */
+			struct list_head next;
 		};
 	};
 };
 
 static const struct file_operations monitor_fops;
 
-struct evl_monitor *get_monitor_by_fd(int efd, struct evl_file **efilpp)
+static struct evl_monitor *get_monitor_by_fd(int efd, struct evl_file **efilpp)
 {
 	struct evl_file *efilp = evl_get_file(efd);
 
@@ -290,13 +304,13 @@ static int trywait_count(struct evl_monitor *event)
 	int ret = 0, val;
 
 	/* atomic_dec_unless_zero_or_negative */
-	val = atomic_read(&state->u.event.value);
+	val = atomic_read(__ATOMIC32(&state->u.event.value));
 	do {
 		if (unlikely(val <= 0)) {
 			ret = -EAGAIN;
 			break;
 		}
-	} while (!atomic_try_cmpxchg(&state->u.event.value, &val, val - 1));
+	} while (!atomic_try_cmpxchg(__ATOMIC32(&state->u.event.value), &val, val - 1));
 
 	return ret;
 }
@@ -320,14 +334,14 @@ static int wait_count(struct file *filp,
 		 * likely going to wait anyway.
 		 */
 		raw_spin_lock_irqsave(&event->wait_queue.wchan.lock, flags);
-		if (atomic_dec_return(&state->u.event.value) < 0) {
+		if (atomic_dec_return(__ATOMIC32(&state->u.event.value)) < 0) {
 			evl_add_wait_queue(&event->wait_queue,
 					timeout, tmode);
 			raw_spin_unlock_irqrestore(&event->wait_queue.wchan.lock,
 						flags);
 			ret = evl_wait_schedule(&event->wait_queue);
 			if (ret) { /* Rollback decrement if failed. */
-				atomic_inc(&state->u.event.value);
+				atomic_inc(__ATOMIC32(&state->u.event.value));
 			} else {
 				/*
 				 * If waking up on a broadcast, we did
@@ -376,11 +390,11 @@ static int post_count(struct evl_monitor *event, s32 sigval,
 			 * added back to the count.
 			 */
 			if (val > 0)
-				atomic_add(val, &state->u.event.value);
+				atomic_add(val, __ATOMIC32(&state->u.event.value));
 			/* Userland might have slipped in, re-check. */
-			pollable = atomic_read(&state->u.event.value) > 0;
+			pollable = atomic_read(__ATOMIC32(&state->u.event.value)) > 0;
 		} else {
-			if (atomic_inc_return(&state->u.event.value) <= 0) {
+			if (atomic_inc_return(__ATOMIC32(&state->u.event.value)) <= 0) {
 				evl_wake_up_head(&event->wait_queue);
 				pollable = false;
 			}
@@ -397,6 +411,24 @@ static int post_count(struct evl_monitor *event, s32 sigval,
 	return ret;
 }
 
+static void inband_wake_r_irqwork(struct irq_work *work) /* in-band */
+{
+	struct evl_monitor *event;
+
+	event = container_of(work, struct evl_monitor, inband_wake_r);
+	wake_up(&event->inband_wait_r);
+	evl_put_element(&event->element);
+}
+
+static void inband_wake_w_irqwork(struct irq_work *work) /* in-band */
+{
+	struct evl_monitor *event;
+
+	event = container_of(work, struct evl_monitor, inband_wake_w);
+	wake_up(&event->inband_wait_w);
+	evl_put_element(&event->element);
+}
+
 /* event->wait_queue.wchan.lock held, dropped on success, irqs off. */
 static bool __trywait_mask(struct evl_monitor *event,
 			s32 match_value,
@@ -407,11 +439,11 @@ static bool __trywait_mask(struct evl_monitor *event,
 	struct evl_monitor_state *state = event->state;
 	int testval;
 
-	*r_value = atomic_read(&state->u.event.value) & match_value;
+	*r_value = atomic_read(__ATOMIC32(&state->u.event.value)) & match_value;
 	testval = exact_match ? match_value : *r_value;
 	if (*r_value && *r_value == testval) {
-		atomic_andnot(*r_value, &state->u.event.value);
-		testval = atomic_read(&state->u.event.value);
+		atomic_andnot(*r_value, __ATOMIC32(&state->u.event.value));
+		testval = atomic_read(__ATOMIC32(&state->u.event.value));
 		raw_spin_unlock_irqrestore(&event->wait_queue.wchan.lock, flags);
 		if (!testval) {
 			evl_signal_poll_events(&event->poll_head, POLLOUT|POLLWRNORM);
@@ -423,7 +455,7 @@ static bool __trywait_mask(struct evl_monitor *event,
 	return false;
 }
 
-static int trywait_mask(struct evl_monitor *event,
+static int trywait_mask_oob(struct evl_monitor *event,
 			s32 match_value,
 			bool exact_match,
 			s32 *r_value)
@@ -453,7 +485,7 @@ struct evl_mask_wait {
 	bool exact_match;
 };
 
-static int wait_mask(struct file *filp,
+static int wait_mask_oob(struct file *filp,
 		ktime_t timeout,
 		enum evl_tmode tmode,
 		s32 match_value,
@@ -472,7 +504,7 @@ static int wait_mask(struct file *filp,
 	raw_spin_lock_irqsave(&event->wait_queue.wchan.lock, flags);
 
 	if (__trywait_mask(event, match_value, exact_match, r_value, flags))
-		return 0;	/* lock already dropped. */
+		return 0;	/* oob lock already dropped on success. */
 
 	if (filp->f_flags & O_NONBLOCK) {
 		raw_spin_unlock_irqrestore(&event->wait_queue.wchan.lock, flags);
@@ -512,11 +544,11 @@ static int post_mask(struct evl_monitor *event, int bits, bool bcast)
 	 * word when an ABI jump is required from applications for
 	 * some compelling reason.
 	 */
-	atomic_or(bits, &state->u.event.value);
+	atomic_or(bits, __ATOMIC32(&state->u.event.value));
 
 	evl_for_each_waiter_safe(waiter, tmp, &event->wait_queue) {
 		w = waiter->wait_data;
-		waitval = w->value & atomic_read(&state->u.event.value);
+		waitval = w->value & atomic_read(__ATOMIC32(&state->u.event.value));
 		testval = w->exact_match ? w->value : waitval;
 		if (waitval && waitval == testval) {
 			w->value = waitval;
@@ -528,9 +560,9 @@ static int post_mask(struct evl_monitor *event, int bits, bool bcast)
 	}
 
 	if (consumed)
-		atomic_andnot(consumed, &state->u.event.value);
+		atomic_andnot(consumed, __ATOMIC32(&state->u.event.value));
 
-	val = atomic_read(&state->u.event.value);
+	val = atomic_read(__ATOMIC32(&state->u.event.value));
 
 	raw_spin_unlock_irqrestore(&event->wait_queue.wchan.lock, flags);
 
@@ -538,6 +570,21 @@ static int post_mask(struct evl_monitor *event, int bits, bool bcast)
 			val ? POLLIN|POLLRDNORM : POLLOUT|POLLWRNORM);
 
 	evl_schedule();
+
+	/*
+	 * Now wake up any in-band waiter if we still have events to
+	 * consume.
+	 */
+	smp_mb();
+	if (val && waitqueue_active(&event->inband_wait_r)) {
+		if (running_inband()) {
+			wake_up(&event->inband_wait_r);
+		} else {
+			evl_get_element(&event->element);
+			if (!irq_work_queue(&event->inband_wake_r))
+				evl_put_element(&event->element);
+		}
+	}
 
 	return 0;
 }
@@ -691,8 +738,8 @@ static int wait_monitor(struct file *filp,
 			*r_op_ret = wait_count(filp, timeout, tmode);
 			break;
 		case EVL_EVENT_MASK:
-			*r_op_ret = wait_mask(filp, timeout, tmode, req->value,
-					      exact_match, r_value);
+			*r_op_ret = wait_mask_oob(filp, timeout, tmode, req->value,
+						exact_match, r_value);
 			break;
 		default:
 			*r_op_ret = -EINVAL;
@@ -768,7 +815,7 @@ static long monitor_common_ioctl(struct file *filp, unsigned int cmd,
 			ret = trywait_count(event);
 			break;
 		case EVL_EVENT_MASK:
-			ret = trywait_mask(event, twreq.value, exact_match, &value);
+			ret = trywait_mask_oob(event, twreq.value, exact_match, &value);
 			if (!ret)
 				raw_put_user(value, &u_twreq->value);
 			break;
@@ -874,7 +921,7 @@ static void monitor_unwatch(struct evl_poll_head *head)
 	struct evl_monitor *mon;
 
 	mon = container_of(head, struct evl_monitor, poll_head);
-	atomic_dec(&mon->state->u.event.pollrefs);
+	atomic_dec(__ATOMIC32(&mon->state->u.event.pollrefs));
 }
 
 static __poll_t monitor_oob_poll(struct file *filp,
@@ -895,8 +942,8 @@ static __poll_t monitor_oob_poll(struct file *filp,
 		switch (mon->protocol) {
 		case EVL_EVENT_COUNT:
 			evl_poll_watch(&mon->poll_head, wait, monitor_unwatch);
-			atomic_inc(&state->u.event.pollrefs);
-			if (atomic_read(&state->u.event.value) > 0)
+			atomic_inc(__ATOMIC32(&state->u.event.pollrefs));
+			if (atomic_read(__ATOMIC32(&state->u.event.value)) > 0)
 				ret = POLLIN|POLLRDNORM;
 			break;
 		case EVL_EVENT_MASK:
@@ -906,8 +953,8 @@ static __poll_t monitor_oob_poll(struct file *filp,
 			 * date as long as we support legacy ABIs
 			 * (pre-32).
 			 */
-			atomic_inc(&state->u.event.pollrefs);
-			val = atomic_read(&state->u.event.value);
+			atomic_inc(__ATOMIC32(&state->u.event.pollrefs));
+			val = atomic_read(__ATOMIC32(&state->u.event.value));
 			/*
 			 * Return POLLIN when some bits are present,
 			 * ready for consumption, or POLLOUT when the
@@ -960,10 +1007,160 @@ static int monitor_release(struct inode *inode, struct file *filp)
 	return evl_release_element(inode, filp);
 }
 
+static ssize_t monitor_read(struct file *filp, char __user *u_buf,
+			size_t count, loff_t *ppos)
+{
+	struct evl_monitor *event = element_of(filp, struct evl_monitor);
+	struct wait_queue_entry wq_entry;
+	unsigned long flags, ib_flags;
+	int ret = 0;
+	s32 val;
+
+	if (event->type != EVL_MONITOR_EVENT || event->protocol != EVL_EVENT_MASK)
+		return -EINVAL;
+
+	if (count != sizeof(s32))
+		return -EINVAL;
+
+	init_wait_entry(&wq_entry, 0);
+
+	for (;;) {
+		spin_lock_irqsave(&event->inband_wait_r.lock, ib_flags);
+		raw_spin_lock_irqsave(&event->wait_queue.wchan.lock, flags);
+
+		if (signal_pending(current)) {
+			ret = -ERESTARTSYS;
+			break;
+		}
+
+		if (list_empty(&wq_entry.entry))
+			__add_wait_queue(&event->inband_wait_r, &wq_entry);
+
+		/* Disjunctive operation. */
+		if (__trywait_mask(event, -1, false, &val, flags))
+			goto unlocked;
+
+		if (filp->f_flags & O_NONBLOCK) {
+			ret = -EAGAIN;
+			break;
+		}
+
+		set_current_state(TASK_INTERRUPTIBLE);
+		raw_spin_unlock_irqrestore(&event->wait_queue.wchan.lock, flags);
+		spin_unlock_irqrestore(&event->inband_wait_r.lock, ib_flags);
+		schedule();
+	}
+
+	raw_spin_unlock_irqrestore(&event->wait_queue.wchan.lock, flags);
+unlocked:
+	list_del(&wq_entry.entry);
+
+	spin_unlock_irqrestore(&event->inband_wait_r.lock, ib_flags);
+
+	/*
+	 * If we have successfully collected all the bits, send a
+	 * POLLOUT wakeup.
+	 */
+	smp_mb();	/* Matches mb in set_current_state() */
+	if (!ret && waitqueue_active(&event->inband_wait_w))
+		wake_up(&event->inband_wait_w);
+
+	return copy_to_user(u_buf, &val, sizeof(val)) ? -EFAULT : sizeof(val);
+}
+
+static ssize_t monitor_write(struct file *filp, const char __user *u_buf,
+			size_t count, loff_t *ppos)
+{
+	struct evl_monitor *event = element_of(filp, struct evl_monitor);
+	s32 val;
+	int ret;
+
+	if (event->type != EVL_MONITOR_EVENT || event->protocol != EVL_EVENT_MASK)
+		return -EINVAL;
+
+	if (count != sizeof(s32))
+		return -EINVAL;
+
+	ret = copy_from_user(&val, u_buf, sizeof(val));
+	if (ret)
+		return -EFAULT;
+
+	/* Unicast operation. */
+	return post_mask(event, val, false) ?: sizeof(val);
+}
+
+static ssize_t monitor_oob_read(struct file *filp,
+				char __user *u_buf, size_t count)
+{
+	struct evl_monitor *event = element_of(filp, struct evl_monitor);
+	s32 val;
+	int ret;
+
+	if (event->type != EVL_MONITOR_EVENT || event->protocol != EVL_EVENT_MASK)
+		return -EINVAL;
+
+	if (count != sizeof(s32))
+		return -EINVAL;
+
+	/* Disjunctive operation. */
+	ret = wait_mask_oob(filp, EVL_INFINITE, EVL_REL, -1, false, &val);
+	if (ret)
+		return ret;
+
+	return copy_to_user(u_buf, &val, sizeof(val)) ? -EFAULT : sizeof(val);
+}
+
+static ssize_t monitor_oob_write(struct file *filp,
+				const char __user *u_buf, size_t count)
+{
+	struct evl_monitor *event = element_of(filp, struct evl_monitor);
+	s32 val;
+	int ret;
+
+	if (event->type != EVL_MONITOR_EVENT || event->protocol != EVL_EVENT_MASK)
+		return -EINVAL;
+
+	if (count != sizeof(s32))
+		return -EINVAL;
+
+	ret = copy_from_user(&val, u_buf, sizeof(val));
+	if (ret)
+		return -EFAULT;
+
+	/* Unicast operation. */
+	return post_mask(event, val, false) ?: sizeof(val);
+}
+
+static __poll_t monitor_poll(struct file *filp, poll_table *wait)
+{
+	struct evl_monitor *event = element_of(filp, struct evl_monitor);
+	__poll_t ret = 0;
+	int val;
+
+	if (event->type != EVL_MONITOR_EVENT || event->protocol != EVL_EVENT_MASK)
+		return -EINVAL;
+
+	poll_wait(filp, &event->inband_wait_r, wait);
+	poll_wait(filp, &event->inband_wait_w, wait);
+
+	val = atomic_read(__ATOMIC32(&event->state->u.event.value));
+	if (val)
+		ret |= POLLIN|POLLRDNORM;
+	else
+		ret |= POLLOUT|POLLWRNORM;
+
+	return ret;
+}
+
 static const struct file_operations monitor_fops = {
 	.open		= evl_open_element,
 	.release	= monitor_release,
+	.read		= monitor_read,
+	.write		= monitor_write,
+	.poll		= monitor_poll,
 	.unlocked_ioctl	= monitor_ioctl,
+	.oob_read	= monitor_oob_read,
+	.oob_write	= monitor_oob_write,
 	.oob_ioctl	= monitor_oob_ioctl,
 	.oob_poll	= monitor_oob_poll,
 #ifdef CONFIG_COMPAT
@@ -1045,27 +1242,27 @@ monitor_factory_build(struct evl_factory *fac, const char __user *u_name,
 		switch (attrs.protocol) {
 		case EVL_GATE_PP:
 			state->u.gate.ceiling = attrs.initval;
-			evl_init_named_mutex_pp(&mon->mutex, clock,
-					&state->u.gate.owner,
-					&state->u.gate.ceiling,
-					evl_element_name(&mon->element));
-			INIT_LIST_HEAD(&mon->events);
+			evl_init_mutex_pp(&mon->mutex, clock,
+					__ATOMIC32(&state->u.gate.owner),
+					&state->u.gate.ceiling);
 			break;
 		case EVL_GATE_PI:
-			evl_init_named_mutex_pi(&mon->mutex, clock,
-					&state->u.gate.owner,
-					evl_element_name(&mon->element));
-			INIT_LIST_HEAD(&mon->events);
+			evl_init_mutex_pi(&mon->mutex, clock,
+					__ATOMIC32(&state->u.gate.owner));
 			break;
 		}
 		raw_spin_lock_init(&mon->lock);
+		INIT_LIST_HEAD(&mon->events);
 		break;
 	case EVL_MONITOR_EVENT:
-		evl_init_named_wait(&mon->wait_queue, clock, EVL_WAIT_PRIO,
-				evl_element_name(&mon->element));
+		evl_init_wait(&mon->wait_queue, clock, EVL_WAIT_PRIO);
 		state->u.event.gate_offset = EVL_MONITOR_NOGATE;
-		atomic_set(&state->u.event.value, attrs.initval);
+		atomic_set(__ATOMIC32(&state->u.event.value), attrs.initval);
 		evl_init_poll_head(&mon->poll_head);
+		init_waitqueue_head(&mon->inband_wait_r);
+		init_waitqueue_head(&mon->inband_wait_w);
+		init_irq_work(&mon->inband_wake_r, inband_wake_r_irqwork);
+		init_irq_work(&mon->inband_wake_w, inband_wake_w_irqwork);
 	}
 
 	/*
@@ -1138,11 +1335,11 @@ static ssize_t state_show(struct device *dev,
 		switch (mon->protocol) {
 		case EVL_EVENT_MASK:
 			ret = snprintf(buf, PAGE_SIZE, "%#x\n",
-				atomic_read(&state->u.event.value));
+			       atomic_read(__ATOMIC32(&state->u.event.value)));
 			break;
 		case EVL_EVENT_COUNT:
 			ret = snprintf(buf, PAGE_SIZE, "%d\n",
-				atomic_read(&state->u.event.value));
+			       atomic_read(__ATOMIC32(&state->u.event.value)));
 			break;
 		case EVL_EVENT_GATED:
 			ret = snprintf(buf, PAGE_SIZE, "%#x\n",
@@ -1150,7 +1347,7 @@ static ssize_t state_show(struct device *dev,
 			break;
 		}
 	} else {
-		fun = atomic_read(&state->u.gate.owner);
+		fun = atomic_read(__ATOMIC32(&state->u.gate.owner));
 		if (fun != EVL_NO_HANDLE) {
 			owner = evl_get_factory_element_by_fundle(&evl_thread_factory,
 						evl_get_index(fun),

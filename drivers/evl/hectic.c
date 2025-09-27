@@ -18,7 +18,7 @@
 #include <evl/file.h>
 #include <evl/stax.h>
 #include <asm/evl/fptest.h>
-#include <uapi/evl/devices/hectic.h>
+#include <uapi/evl/devices/hectic-abi.h>
 #include <trace/events/evl.h>
 
 #define HECTIC_KTHREAD      0x20000
@@ -612,7 +612,7 @@ static int hectic_open(struct inode *inode, struct file *filp)
 
 	init_irq_work(&ctx->wake_utask, rtswitch_utask_waker);
 	evl_init_timer(&ctx->wake_up_delay, timed_wake_up);
-	evl_init_stax(&ctx->stax);
+	evl_init_stax(&ctx->stax, 0);
 
 	filp->private_data = ctx;
 	stream_open(inode, filp);
@@ -650,7 +650,6 @@ static int hectic_release(struct inode *inode, struct file *filp)
 
 static struct class hectic_class = {
 	.name = "hectic",
-	.owner = THIS_MODULE,
 };
 
 static const struct file_operations hectic_fops = {
@@ -711,6 +710,7 @@ static void __exit hectic_exit(void)
 {
 	device_destroy(&hectic_class, MKDEV(MAJOR(hectic_devt), 0));
 	cdev_del(&hectic_cdev);
+	unregister_chrdev_region(hectic_devt, 1);
 	class_unregister(&hectic_class);
 }
 module_exit(hectic_exit);

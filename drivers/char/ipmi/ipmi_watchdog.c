@@ -23,6 +23,7 @@
 #include <linux/init.h>
 #include <linux/completion.h>
 #include <linux/kdebug.h>
+#include <linux/kstrtox.h>
 #include <linux/rwsem.h>
 #include <linux/errno.h>
 #include <linux/uaccess.h>
@@ -212,8 +213,7 @@ static int set_param_str(const char *val, const struct kernel_param *kp)
 	char       valcp[16];
 	char       *s;
 
-	strncpy(valcp, val, 15);
-	valcp[15] = '\0';
+	strscpy(valcp, val, 16);
 
 	s = strstrip(valcp);
 
@@ -802,7 +802,7 @@ static ssize_t ipmi_read(struct file *file,
 
 		init_waitqueue_entry(&wait, current);
 		add_wait_queue(&read_q, &wait);
-		while (!data_to_read) {
+		while (!data_to_read && !signal_pending(current)) {
 			set_current_state(TASK_INTERRUPTIBLE);
 			spin_unlock_irq(&ipmi_read_lock);
 			schedule();
@@ -903,7 +903,6 @@ static const struct file_operations ipmi_wdog_fops = {
 	.open    = ipmi_open,
 	.release = ipmi_close,
 	.fasync  = ipmi_fasync,
-	.llseek  = no_llseek,
 };
 
 static struct miscdevice ipmi_wdog_miscdev = {

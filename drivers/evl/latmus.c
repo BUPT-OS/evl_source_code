@@ -20,7 +20,7 @@
 #include <evl/thread.h>
 #include <evl/xbuf.h>
 #include <evl/uaccess.h>
-#include <uapi/evl/devices/latmus.h>
+#include <uapi/evl/devices/latmus-abi.h>
 #include <trace/events/evl.h>
 
 #define TUNER_SAMPLING_TIME	500000000UL
@@ -439,7 +439,7 @@ static struct latmus_runner *create_sirq_runner(int cpu)
 	return &sirq_runner->runner;
 }
 
-void kthread_handler(void *arg)
+static void kthread_handler(void *arg)
 {
 	struct kthread_runner *k_runner = arg;
 	ktime_t now;
@@ -1172,7 +1172,6 @@ static int latmus_release(struct inode *inode, struct file *filp)
 
 static struct class latmus_class = {
 	.name = "latmus",
-	.owner = THIS_MODULE,
 };
 
 static const struct file_operations latmus_fops = {
@@ -1231,6 +1230,7 @@ static void __exit latmus_exit(void)
 {
 	device_destroy(&latmus_class, MKDEV(MAJOR(latmus_devt), 0));
 	cdev_del(&latmus_cdev);
+	unregister_chrdev_region(latmus_devt, 1);
 	class_unregister(&latmus_class);
 }
 module_exit(latmus_exit);

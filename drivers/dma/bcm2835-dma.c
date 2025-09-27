@@ -370,7 +370,7 @@ static struct bcm2835_desc *bcm2835_dma_create_cb_chain(
 	/* the last frame requires extra flags */
 	d->cb_list[d->frames - 1].cb->info |= finalextrainfo;
 
-	/* detect a size missmatch */
+	/* detect a size mismatch */
 	if (buf_len && (d->size != buf_len))
 		goto error_cb;
 
@@ -497,6 +497,7 @@ static inline bool is_base_irq_handler(void)
 
 static irqreturn_t bcm2835_dma_callback(int irq, void *data)
 {
+	irqreturn_t ret = IRQ_HANDLED;
 	struct bcm2835_chan *c = data;
 	struct bcm2835_desc *d;
 	unsigned long flags;
@@ -510,8 +511,12 @@ static irqreturn_t bcm2835_dma_callback(int irq, void *data)
 			return IRQ_NONE;
 	}
 
-	/* CAUTION: If running in-band, hard irqs are on. */
-	vchan_lock_irqsave(&c->vc, flags);
+	/*
+	 * Hybrid locking of oob-enabled vchans ensures that hard IRQ
+	 * are disabled across the locked section, including from the
+	 * in-band stage.
+	 */
+	vchan_lock(&c->vc);
 
 	/*
 	 * Clear the INT flag to receive further interrupts. Keep the channel
@@ -534,15 +539,14 @@ static irqreturn_t bcm2835_dma_callback(int irq, void *data)
 		 * stage, schedule a callback from in-band context.
 		 */
 		if (!do_channel(c, d))
-			irq_post_inband(irq);
+			ret = IRQ_FORWARD;
 	} else {
 		do_channel(c, d);
 	}
-
 out:
-	vchan_unlock_irqrestore(&c->vc, flags);
+	vchan_unlock(&c->vc);
 
-	return IRQ_HANDLED;
+	return ret;
 }
 
 static int bcm2835_dma_alloc_chan_resources(struct dma_chan *chan)
@@ -972,7 +976,6 @@ static struct dma_chan *bcm2835_dma_xlate(struct of_phandle_args *spec,
 static int bcm2835_dma_probe(struct platform_device *pdev)
 {
 	struct bcm2835_dmadev *od;
-	struct resource *res;
 	void __iomem *base;
 	int rc;
 	int i, j;
@@ -996,8 +999,7 @@ static int bcm2835_dma_probe(struct platform_device *pdev)
 
 	dma_set_max_seg_size(&pdev->dev, 0x3FFFFFFF);
 
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	base = devm_ioremap_resource(&pdev->dev, res);
+	base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(base))
 		return PTR_ERR(base);
 
@@ -1117,19 +1119,17 @@ err_no_dma:
 	return rc;
 }
 
-static int bcm2835_dma_remove(struct platform_device *pdev)
+static void bcm2835_dma_remove(struct platform_device *pdev)
 {
 	struct bcm2835_dmadev *od = platform_get_drvdata(pdev);
 
 	dma_async_device_unregister(&od->ddev);
 	bcm2835_dma_free(od);
-
-	return 0;
 }
 
 static struct platform_driver bcm2835_dma_driver = {
 	.probe	= bcm2835_dma_probe,
-	.remove	= bcm2835_dma_remove,
+	.remove_new = bcm2835_dma_remove,
 	.driver = {
 		.name = "bcm2835-dma",
 		.of_match_table = of_match_ptr(bcm2835_dma_of_match),

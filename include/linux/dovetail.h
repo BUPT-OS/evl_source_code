@@ -6,6 +6,12 @@
 #ifndef _LINUX_DOVETAIL_H
 #define _LINUX_DOVETAIL_H
 
+struct pt_regs;
+struct mm_struct;
+struct task_struct;
+struct file;
+struct files_struct;
+
 #ifdef CONFIG_DOVETAIL
 
 #include <linux/sched.h>
@@ -14,11 +20,6 @@
 #include <linux/irqstage.h>
 #include <uapi/asm-generic/dovetail.h>
 #include <asm/dovetail.h>
-
-struct pt_regs;
-struct task_struct;
-struct file;
-struct files_struct;
 
 enum inband_event_type {
 	INBAND_TASK_SIGNAL,
@@ -228,14 +229,48 @@ void uninstall_inband_fd(unsigned int fd, struct file *file,
 void replace_inband_fd(unsigned int fd, struct file *file,
 		       struct files_struct *files);
 
+int __pipeline_syscall(struct pt_regs *regs);
+
+int handle_oob_syscall(struct pt_regs *regs);
+
+int handle_pipelined_syscall(struct irq_stage *stage,
+			struct pt_regs *regs);
+
+void handle_oob_mayday(struct pt_regs *regs);
+
+void handle_oob_trap_entry(unsigned int trapnr,
+			struct pt_regs *regs);
+
+void handle_oob_trap_exit(unsigned int trapnr,
+			struct pt_regs *regs);
+
+void handle_inband_event(enum inband_event_type event,
+			void *data);
+
+void resume_oob_task(struct task_struct *p);
+
+#ifndef arch_dovetail_is_prctl
+#define arch_dovetail_is_prctl(__nr)	((__nr) == __NR_prctl)
+#endif
+
+#ifndef arch_dovetail_is_syscall
+#define arch_dovetail_is_syscall(__tsk, __nr, __regs)			\
+	({								\
+		bool __is_prctl = arch_dovetail_is_prctl(__nr);		\
+		__is_prctl && syscall_get_arg0(__tsk, __regs) == PR_OOB_SYSCALL; \
+	})
+#endif
+
+bool in_oob_syscall(struct pt_regs *regs);
+
 #else	/* !CONFIG_DOVETAIL */
+
+#include <linux/irqflags.h>
 
 #ifdef CONFIG_HAVE_DOVETAIL
 /* We may have arch-specific placeholders. */
 #include <asm/dovetail.h>
 #endif
-
-struct files_struct;
 
 #define protect_inband_mm(__flags)	\
 	do { (void)(__flags); } while (0)
@@ -308,6 +343,13 @@ static inline
 void replace_inband_fd(unsigned int fd, struct file *file,
 		       struct files_struct *files) { }
 
+#define arch_dovetail_is_syscall(__tsk, __nr, __regs)	false
+
+static inline bool in_oob_syscall(struct pt_regs *regs)
+{
+	return false;
+}
+
 #endif	/* !CONFIG_DOVETAIL */
 
 static __always_inline bool dovetailing(void)
@@ -319,9 +361,5 @@ static __always_inline bool dovetail_debug(void)
 {
 	return IS_ENABLED(CONFIG_DEBUG_DOVETAIL);
 }
-
-#ifndef arch_dovetail_is_syscall
-#define arch_dovetail_is_syscall(__nr)	((__nr) == __NR_prctl)
-#endif
 
 #endif /* _LINUX_DOVETAIL_H */

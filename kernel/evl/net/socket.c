@@ -7,13 +7,12 @@
 #include <linux/types.h>
 #include <linux/fs.h>
 #include <linux/slab.h>
-#include <linux/module.h>
+#include <linux/export.h>
 #include <linux/file.h>
 #include <linux/net.h>
 #include <linux/socket.h>
 #include <linux/mutex.h>
 #include <linux/if_ether.h>
-#include <linux/uio.h>
 #include <linux/err.h>
 #include <linux/hashtable.h>
 #include <linux/jhash.h>
@@ -28,9 +27,12 @@
 #include <evl/net.h>
 #include <evl/poll.h>
 #include <evl/memory.h>
+#include <evl/uio.h>
+#include <evl/net/offload.h>
 #include <evl/net/skb.h>
 #include <evl/net/socket.h>
 #include <evl/net/device.h>
+#include <evl/net/timestamping.h>
 
 /*
  * EVL sockets are (almost) regular sockets, extended with out-of-band
@@ -56,173 +58,20 @@ struct domain_list_head {
 /*
  * EVL sockets are always bound to an EVL file (see
  * sock_oob_attach()). We may access our extended socket context via
- * filp->oob_data or sock->sk->oob_data, which works for all socket
+ * filp->f_oob_ctx or sock->sk->sk_oob_ctx, which works for all socket
  * families.
  */
 static inline struct evl_socket *evl_sk_from_file(struct file *filp)
 {
-	return filp->oob_data ?
-		container_of(filp->oob_data, struct evl_socket, efile) :
+	return filp->f_oob_ctx ?
+		container_of(filp->f_oob_ctx, struct evl_socket, efile) :
 		NULL;
 }
 
-static inline struct evl_socket *evl_sk(struct socket *sock)
+static inline struct evl_socket *evl_sk(struct sock *sk)
 {
-	return sock->sk->oob_data;
+	return sk->sk_oob_ctx;
 }
-
-static int load_iov_native(struct iovec *iov,
-			const struct iovec __user *u_iov,
-			size_t iovlen)
-{
-	return raw_copy_from_user(iov, u_iov, iovlen * sizeof(*u_iov)) ?
-		-EFAULT : 0;
-}
-
-#ifdef CONFIG_COMPAT
-
-int do_load_iov(struct iovec *iov,
-		const struct iovec __user *u_iov,
-		size_t iovlen)
-{
-	struct compat_iovec c_iov[UIO_FASTIOV], __user *uc_iov;
-	size_t nvec = 0;
-	int ret, n, i;
-
-	if (likely(!is_compat_oob_call()))
-		return load_iov_native(iov, u_iov, iovlen);
-
-	uc_iov = (struct compat_iovec *)u_iov;
-
-	/*
-	 * Slurp compat_iovector in by chunks of UIO_FASTIOV
-	 * cells. This is faster in the most likely case compared to
-	 * allocating yet another in-kernel vector dynamically for
-	 * such purpose.
-	 */
-	while (nvec < iovlen) {
-		n = iovlen - nvec;
-		if (n > UIO_FASTIOV)
-			n = UIO_FASTIOV;
-		ret = raw_copy_from_user(c_iov, uc_iov, sizeof(*uc_iov) * n);
-		if (ret)
-			return -EFAULT;
-		for (i = 0; i < n; i++, iov++) {
-			iov->iov_base = compat_ptr(c_iov[i].iov_base);
-			iov->iov_len = c_iov[i].iov_len;
-		}
-		uc_iov += n;
-		nvec += n;
-	}
-
-	return 0;
-}
-
-#else
-
-static inline int do_load_iov(struct iovec *iov,
-			const struct iovec __user *u_iov,
-			size_t iovlen)
-{
-	return load_iov_native(iov, u_iov, iovlen);
-}
-
-#endif
-
-static struct iovec *
-load_iov(const struct iovec __user *u_iov, size_t iovlen,
-	struct iovec *fast_iov)
-{
-	struct iovec *slow_iov;
-	int ret;
-
-	if (iovlen > UIO_MAXIOV)
-		return ERR_PTR(-EINVAL);
-
-	if (likely(iovlen <= UIO_FASTIOV)) {
-		ret = do_load_iov(fast_iov, u_iov, iovlen);
-		return ret ? ERR_PTR(ret) : fast_iov;
-	}
-
-	slow_iov = evl_alloc(iovlen * sizeof(*u_iov));
-	if (slow_iov == NULL)
-		return ERR_PTR(-ENOMEM);
-
-	ret = do_load_iov(slow_iov, u_iov, iovlen);
-	if (ret) {
-		evl_free(slow_iov);
-		return ERR_PTR(ret);
-	}
-
-	return slow_iov;
-}
-
-ssize_t evl_export_iov(const struct iovec *iov, size_t iovlen,
-		const void *data, size_t len)
-{
-	ssize_t written = 0;
-	size_t nbytes;
-	int n, ret;
-
-	for (n = 0; len > 0 && n < iovlen; n++, iov++) {
-		if (iov->iov_len == 0)
-			continue;
-
-		nbytes = iov->iov_len;
-		if (nbytes > len)
-			nbytes = len;
-
-		ret = raw_copy_to_user(iov->iov_base, data, nbytes);
-		if (ret)
-			return -EFAULT;
-
-		len -= nbytes;
-		data += nbytes;
-		written += nbytes;
-		if (written < 0)
-			return -EINVAL;
-	}
-
-	return written;
-}
-EXPORT_SYMBOL_GPL(evl_export_iov);
-
-ssize_t evl_import_iov(const struct iovec *iov, size_t iovlen,
-		       void *data, size_t len, size_t *remainder)
-{
-	size_t nbytes, avail = 0;
-	ssize_t read = 0;
-	int n, ret;
-
-	for (n = 0; len > 0 && n < iovlen; n++, iov++) {
-		if (iov->iov_len == 0)
-			continue;
-
-		nbytes = iov->iov_len;
-		avail += nbytes;
-		if (nbytes > len)
-			nbytes = len;
-
-		ret = raw_copy_from_user(data, iov->iov_base, nbytes);
-		if (ret)
-			return -EFAULT;
-
-		len -= nbytes;
-		data += nbytes;
-		read += nbytes;
-		if (read < 0)
-			return -EINVAL;
-	}
-
-	if (remainder) {
-		for (; n < iovlen; n++, iov++)
-			avail += iov->iov_len;
-		*remainder = avail - read;
-	}
-
-	return read;
-}
-EXPORT_SYMBOL_GPL(evl_import_iov);
 
 static inline u32 get_domain_hash(int af_domain)
 {
@@ -298,51 +147,39 @@ void evl_unregister_socket_domain(struct evl_socket_domain *domain)
 	mutex_unlock(&domain_lock);
 }
 
-static inline bool charge_socket_wmem(struct evl_socket *esk,
-				struct sk_buff *skb)
+static inline bool charge_socket_wmem(struct evl_socket *esk, size_t size)
 {				/* esk->wmem_wait.wchan.lock held */
 	if (atomic_read(&esk->wmem_count) >= esk->wmem_max)
 		return false;
 
-	atomic_add(skb->truesize, &esk->wmem_count);
-	EVL_NET_CB(skb)->tracker = esk;
+	atomic_add(size, &esk->wmem_count);
 	evl_down_crossing(&esk->wmem_drain);
 
 	return true;
 }
 
-int evl_charge_socket_wmem(struct evl_socket *esk,
-			struct sk_buff *skb,
-			ktime_t timeout, enum evl_tmode tmode)
+int evl_charge_socket_wmem(struct evl_socket *esk, size_t size,
+		ktime_t timeout, enum evl_tmode tmode)
 {
-	EVL_NET_CB(skb)->tracker = NULL;
-
 	if (!esk->wmem_max)	/* Unlimited. */
 		return 0;
 
-	return evl_wait_event_timeout(&esk->wmem_wait,
-				timeout, tmode,
-				charge_socket_wmem(esk, skb));
+	return evl_wait_event_timeout(&esk->wmem_wait, timeout, tmode,
+				charge_socket_wmem(esk, size));
 }
 
-void evl_uncharge_socket_wmem(struct sk_buff *skb)
+void evl_uncharge_socket_wmem(struct evl_socket *esk, size_t size)
 {
-	struct evl_socket *esk = EVL_NET_CB(skb)->tracker;
 	unsigned long flags;
 	int count;
 
-	if (!esk)
-		return;
-
 	/*
 	 * The tracking socket cannot be stale as it has to pass the
-	 * wmem_crossing first before unwinding in sock_oob_detach().
+	 * wmem_crossing first before unwinding in sock_oob_destroy().
 	 */
 	raw_spin_lock_irqsave(&esk->wmem_wait.wchan.lock, flags);
 
-	EVL_NET_CB(skb)->tracker = NULL;
-
-	count = atomic_sub_return(skb->truesize, &esk->wmem_count);
+	count = atomic_sub_return(size, &esk->wmem_count);
 	if (count < esk->wmem_max && evl_wait_active(&esk->wmem_wait))
 		evl_flush_wait_locked(&esk->wmem_wait, 0);
 
@@ -354,8 +191,7 @@ void evl_uncharge_socket_wmem(struct sk_buff *skb)
 }
 
 /* in-band */
-static struct evl_net_proto *
-find_oob_proto(int domain, int type, __be16 protocol)
+static struct evl_net_proto *find_oob_proto(int domain, int type, int protocol)
 {
 	struct evl_net_proto *proto = NULL;
 	struct domain_list_head *head;
@@ -383,15 +219,57 @@ find_oob_proto(int domain, int type, __be16 protocol)
 }
 
 /*
- * In-band call from the common network stack creating a new socket,
- * @sock is already bound to a file. We know the following:
+ * The inband offload handler. Handles packets for which we cannot
+ * handle from the oob stage directly (e.g. because we don't have the
+ * routing information available in our oob front-cache).
+ */
+static void inband_offload_handler(struct evl_work *work)
+{
+	struct evl_socket *esk =
+		container_of(work, struct evl_socket, inband_offload);
+
+	if (EVL_WARN_ON(NET, !esk->proto->handle_offload))
+		return;
+
+	esk->proto->handle_offload(esk);
+
+	/* Release the ref. obtained by evl_net_offload_inband(). */
+	evl_put_file(&esk->efile);
+}
+
+/*
+ * Offload a protocol-specific operation to the in-band stage.
+ */
+void evl_net_offload_inband(struct evl_socket *esk,
+			struct evl_net_offload *ofld,
+			struct list_head *q)
+{
+	unsigned long flags;
+
+	/*
+	 * Make sure esk won't vanish until the offload handler has
+	 * run.
+	 */
+	evl_get_fileref(&esk->efile);
+
+	raw_spin_lock_irqsave(&esk->oob_lock, flags);
+	list_add_tail(&ofld->next, q);
+	raw_spin_unlock_irqrestore(&esk->oob_lock, flags);
+
+	if (!evl_call_inband(&esk->inband_offload))
+		evl_put_file(&esk->efile);
+}
+
+/*
+ * In-band call from the common network stack creating a new BSD
+ * socket, @sock is already bound to a file. We know the following:
  *
  * - the caller wants us either to attach an out-of-band extension to
  *   a common protocol (e.g. AF_PACKET over ethernet), or to set up an
  *   mere AF_OOB socket for EVL-specific protocols.
  *
  * - we have no oob extension context for @sock yet
- *   (sock->sk->oob_data is NULL)
+ *   (sock->sk->sk_oob_ctx is NULL)
  */
 int sock_oob_attach(struct socket *sock)
 {
@@ -417,14 +295,18 @@ int sock_oob_attach(struct socket *sock)
 
 	/*
 	 * If sk->sk_family is not PF_OOB, we have no extended oob
-	 * context yet, allocate one to piggyback on a common socket.
+	 * context yet, allocate one to piggyback on a common
+	 * socket. In any case, we assume esk is zero-initialized (see
+	 * sk_alloc).
 	 */
 	if (sk->sk_family != PF_OOB) {
 		esk = kzalloc(sizeof(*esk), GFP_KERNEL);
 		if (esk == NULL)
 			return -ENOMEM;
+		refcount_set(&esk->refs, 2); /* release + destroy */
 	} else {
 		esk = (struct evl_socket *)sk;
+		refcount_set(&esk->refs, 1); /* release only */
 	}
 
 	esk->sk = sk;
@@ -442,7 +324,7 @@ int sock_oob_attach(struct socket *sock)
 	 * in-band network stack already holds a ref. on the net
 	 * struct for that socket.
 	 */
-	esk->net = sock_net(sock->sk);
+	esk->net = sock_net(sk);
 	mutex_init(&esk->lock);
 	INIT_LIST_HEAD(&esk->input);
 	INIT_LIST_HEAD(&esk->next_sub);
@@ -450,16 +332,18 @@ int sock_oob_attach(struct socket *sock)
 	evl_init_wait(&esk->wmem_wait, &evl_mono_clock, 0);
 	evl_init_poll_head(&esk->poll_head);
 	raw_spin_lock_init(&esk->oob_lock);
+	spin_lock_init(&esk->ts_lock);
+	evl_init_work(&esk->inband_offload, inband_offload_handler);
 	/* Inherit the {rw}mem limits from the base socket. */
 	esk->rmem_max = sk->sk_rcvbuf;
 	esk->wmem_max = sk->sk_sndbuf;
 	evl_init_crossing(&esk->wmem_drain);
 
-	ret = proto->attach(esk, proto, sk->sk_protocol);
+	ret = proto->attach(esk, proto, ntohs(sk->sk_protocol));
 	if (ret)
 		goto fail_attach;
 
-	sk->oob_data = esk;
+	sk->sk_oob_ctx = esk;
 
 	return 0;
 
@@ -473,53 +357,119 @@ fail_open:
 }
 
 /*
- * In-band call from the common network stack which is about to
- * release a socket (@sock is out-of-band capable).
+ * In-band call from the common network stack releasing a BSD socket,
+ * @sock is still bound to a file, but the network representation
+ * sock->sk might be stale.
  */
-void sock_oob_detach(struct socket *sock)
+void sock_oob_release(struct socket *sock)
 {
-	struct sock *sk = sock->sk;
-	struct evl_socket *esk = evl_sk(sock);
+	struct evl_socket *esk = evl_sk_from_file(sock->file);
+
+	if (esk->proto->release)
+		esk->proto->release(esk);
 
 	evl_release_file(&esk->efile);
-	/* Wait for the stack to drain in-flight outgoing buffers. */
+	/*
+	 * Wait for the stack to drain in-flight outgoing
+	 * buffers. This guards us against trackers going stale while
+	 * referred to by skbs.
+	 */
 	evl_pass_crossing(&esk->wmem_drain);
+
+	if (refcount_dec_and_test(&esk->refs))
+		kfree(esk);
+}
+
+/*
+ * In-band call from the common network stack which is about to
+ * destruct a socket, releasing all resources attached (@sock is
+ * out-of-band capable).
+ */
+void sock_oob_destroy(struct sock *sk)
+{
+	struct evl_socket *esk = evl_sk(sk);
+
 	/* We are detaching, so rmem_count can be left out of sync. */
 	evl_net_free_skb_list(&esk->input);
+
+	/* Drop any timestamping data. */
+	evl_setup_socket_iots(esk, 0);
 
 	evl_destroy_wait(&esk->input_wait);
 	evl_destroy_wait(&esk->wmem_wait);
 
-	if (esk->proto->detach)
-		esk->proto->detach(esk);
+	if (esk->proto->destroy)
+		esk->proto->destroy(esk);
 
-	if (sk->sk_family != PF_OOB)
-		kfree(esk);	/* i.e. sk->oob_data. */
+	if (sk->sk_family != PF_OOB && refcount_dec_and_test(&esk->refs))
+		kfree(esk);	/* meaning sk != esk. */
 
-	sk->oob_data = NULL;
+	sk->sk_oob_ctx = NULL;
 }
 
 /*
- * In-band call from the common network stack (@sock is out-of-band
- * capable). We end up here after a socket was successful bound to the
- * given address by the common network stack, so that we can do some
- * EVL-specific work on top of that.
+ * In-band call from the common network stack to complete a binding
+ * (@sock is out-of-band capable). We end up here _after_ a successful
+ * binding of the network socket to the given address by the in-band
+ * stack.
  */
-int sock_oob_bind(struct socket *sock, struct sockaddr *addr, int len)
+int sock_oob_bind(struct sock *sk, struct sockaddr *addr, int len)
 {
-	struct sock *sk = sock->sk;
-	struct evl_socket *esk = evl_sk(sock);
+	struct evl_socket *esk = evl_sk(sk);
 
 	/*
-	 * If @sock belongs to PF_OOB, then evl_sock_bind() already
-	 * handled the binding. We ony care about common protocols
+	 * If @sk belongs to PF_OOB, then evl_sock_bind() already
+	 * handled the binding. We only care about common protocols
 	 * for which we have an out-of-band extension
 	 * (e.g. AF_PACKET).
 	 */
-	if (sk->sk_family == PF_OOB)
+	if (sk->sk_family == PF_OOB || !esk->proto->bind)
 		return 0;
 
 	return esk->proto->bind(esk, addr, len);
+}
+
+/*
+ * In-band call from the common network stack to shutdown the
+ * socket. We end up here _after_ the socket was successfully shut
+ * down by the in-band network stack.
+ */
+int sock_oob_shutdown(struct sock *sk, int how)
+{
+	struct evl_socket *esk = evl_sk(sk);
+
+	/*
+	 * If @sk belongs to PF_OOB, then evl_sock_shutdown() already
+	 * handled the connection. We only care about common protocols
+	 * for which we have an out-of-band extension
+	 * (e.g. AF_INET/IPPROTO_UDP).
+	 */
+	if (sk->sk_family == PF_OOB || !esk->proto->shutdown)
+		return 0;
+
+	return esk->proto->shutdown(esk, how);
+}
+
+/*
+ * In-band call from the common network stack to connect the socket.
+ * We end up here _after_ a successful connection of the network
+ * socket to the given address by the in-band stack.
+ */
+int sock_oob_connect(struct sock *sk,
+		struct sockaddr *addr, int len, int flags)
+{
+	struct evl_socket *esk = evl_sk(sk);
+
+	/*
+	 * If @sk belongs to PF_OOB, then evl_sock_connect() already
+	 * handled the connection. We only care about common protocols
+	 * for which we have an out-of-band extension
+	 * (e.g. AF_INET/IPPROTO_UDP).
+	 */
+	if (sk->sk_family == PF_OOB || !esk->proto->connect)
+		return 0;
+
+	return esk->proto->connect(esk, addr, len, flags);
 }
 
 static int socket_send_recv(struct evl_socket *esk,
@@ -541,7 +491,7 @@ static int socket_send_recv(struct evl_socket *esk,
 		return -EFAULT;
 
 	u_iov = evl_valptr64(iov_ptr, struct iovec);
-	iov = load_iov(u_iov, iovlen, fast_iov);
+	iov = evl_load_uio(u_iov, iovlen, fast_iov);
 	if (IS_ERR(iov))
 		return PTR_ERR(iov);
 
@@ -563,6 +513,203 @@ static int socket_send_recv(struct evl_socket *esk,
 	return 0;
 }
 
+static int get_sockoptaddr(const struct evl_net_sockopt __user *u_opt,
+			void __user **u_optval, unsigned int __user **u_optlen,
+			unsigned int *optlen)
+{
+	__u64 optval_ptr, optlen_ptr;
+	__u32 val;
+	int ret;
+
+	ret = raw_get_user(optval_ptr, &u_opt->optval_ptr);
+	if (ret)
+		return -EFAULT;
+
+	ret = raw_get_user(optlen_ptr, &u_opt->optlen_ptr);
+	if (ret)
+		return -EFAULT;
+
+	*u_optval = evl_valptr64(optval_ptr, void);
+	*u_optlen = evl_valptr64(optlen_ptr, __u32);
+
+	ret = raw_get_user(val, *u_optlen);
+	if (ret)
+		return -EFAULT;
+	if (val < *optlen)
+		return -EINVAL;
+
+	*optlen = val;
+
+	return 0;
+}
+
+static int put_sockopt(void __user *u_optval, const void *optval,
+		unsigned int __user *u_optlen, unsigned int optlen)
+{
+	int ret;
+
+	ret = raw_copy_to_user(u_optval, optval, optlen);
+	if (ret)
+		return ret;
+
+	return raw_put_user(optlen, u_optlen) ? -EFAULT : 0;
+}
+
+static int socket_set_rmem(struct evl_socket *esk,
+			struct evl_net_sockopt __user *u_opt)
+{
+	unsigned int optlen = sizeof(__u32), __user *u_optlen;
+	void __user *u_optval;
+	unsigned int val;
+	int ret;
+
+	ret = get_sockoptaddr(u_opt, &u_optval,	&u_optlen, &optlen);
+	if (ret)
+		return ret;
+
+	if (raw_get_user(val, (typeof(val) *)u_optval))
+		return -EFAULT;
+
+	/* Same logic as __sock_set_rcvbuf(). */
+	val = min_t(unsigned int, val, UINT_MAX / 2);
+	WRITE_ONCE(esk->rmem_max, max_t(unsigned int, val * 2, SOCK_MIN_RCVBUF));
+
+	return 0;
+}
+
+static int socket_get_rmem(struct evl_socket *esk,
+			struct evl_net_sockopt __user *u_opt)
+{
+	unsigned int optlen = sizeof(esk->rmem_max), __user *u_optlen;
+	void __user *u_optval;
+	int ret;
+
+	ret = get_sockoptaddr(u_opt, &u_optval,	&u_optlen, &optlen);
+	if (ret)
+		return ret;
+
+	return put_sockopt(u_optval, &esk->rmem_max,
+			u_optlen, sizeof(esk->rmem_max));
+}
+
+static int socket_set_wmem(struct evl_socket *esk,
+			struct evl_net_sockopt __user *u_opt)
+{
+	unsigned int optlen = sizeof(__u32), __user *u_optlen;
+	void __user *u_optval;
+	unsigned int val;
+	int ret;
+
+	ret = get_sockoptaddr(u_opt, &u_optval,	&u_optlen, &optlen);
+	if (ret)
+		return ret;
+
+	if (raw_get_user(val, (typeof(val) *)u_optval))
+		return -EFAULT;
+
+	val = min_t(unsigned int, val, UINT_MAX / 2);
+	WRITE_ONCE(esk->wmem_max, max_t(unsigned int, val * 2, SOCK_MIN_SNDBUF));
+
+	return 0;
+}
+
+static int socket_get_wmem(struct evl_socket *esk,
+			struct evl_net_sockopt __user *u_opt)
+{
+	unsigned int optlen = sizeof(esk->wmem_max), __user *u_optlen;
+	void __user *u_optval;
+	int ret;
+
+	ret = get_sockoptaddr(u_opt, &u_optval,	&u_optlen, &optlen);
+	if (ret)
+		return ret;
+
+	return put_sockopt(u_optval, &esk->wmem_max,
+			u_optlen, sizeof(esk->wmem_max));
+}
+
+static int socket_set_timestamping(struct evl_socket *esk,
+				unsigned int __user *u_optval,
+				unsigned int optlen)
+{
+	unsigned int tsflags;
+
+	if (raw_get_user(tsflags, u_optval))
+		return -EFAULT;
+
+	if (tsflags & ~EVL_SOF_TIMESTAMPS)
+		return -EINVAL;
+
+	/*
+	 * Shorthand: if no specific timestamping location is given,
+	 * disable timestamping entirely.
+	 */
+	if (!(tsflags & (EVL_SOF_TIMESTAMPS &
+		~(EVL_SOF_TIMESTAMP_RX|EVL_SOF_TIMESTAMP_TX))))
+		tsflags = 0;
+
+	evl_setup_socket_iots(esk, tsflags);
+
+	return 0;
+}
+
+static int socket_get_timestamping(struct evl_socket *esk,
+				unsigned int __user *u_optval,
+				int *optlen)
+{
+	*optlen = sizeof(esk->timestamping);
+
+	return raw_put_user(esk->timestamping, u_optval) ? -EFAULT : 0;
+}
+
+static int socket_iocset_option(struct evl_socket *esk,
+			struct evl_net_sockopt __user *u_opt)
+{
+	int level, option;
+
+	if (raw_get_user(level, &u_opt->level))
+		return -EFAULT;
+
+	if (level != SOL_SOCKET)
+		return -EINVAL;
+
+	if (raw_get_user(option, &u_opt->option))
+		return -EFAULT;
+
+	switch (option) {
+	case EVL_SOCKOPT_RECVSZ:
+		return socket_set_rmem(esk, u_opt);
+	case EVL_SOCKOPT_SENDSZ:
+		return socket_set_wmem(esk, u_opt);
+	}
+
+	return -EINVAL;
+}
+
+static int socket_iocget_option(struct evl_socket *esk,
+			struct evl_net_sockopt __user *u_opt)
+{
+	int level, option;
+
+	if (raw_get_user(level, &u_opt->level))
+		return -EFAULT;
+
+	if (level != SOL_SOCKET)
+		return -EINVAL;
+
+	if (raw_get_user(option, &u_opt->option))
+		return -EFAULT;
+
+	switch (option) {
+	case EVL_SOCKOPT_RECVSZ:
+		return socket_get_rmem(esk, u_opt);
+	case EVL_SOCKOPT_SENDSZ:
+		return socket_get_wmem(esk, u_opt);
+	}
+
+	return -EINVAL;
+}
+
 long sock_oob_ioctl(struct file *filp, unsigned int cmd,
 		unsigned long arg)
 {
@@ -578,6 +725,14 @@ long sock_oob_ioctl(struct file *filp, unsigned int cmd,
 	case EVL_SOCKIOC_RECVMSG:
 		u_msghdr = (typeof(u_msghdr))arg;
 		ret = socket_send_recv(esk, u_msghdr, cmd);
+		break;
+	case EVL_SOCKIOC_SETOPT:
+		ret = socket_iocset_option(esk,
+			(struct evl_net_sockopt __user *)arg);
+		break;
+	case EVL_SOCKIOC_GETOPT:
+		ret = socket_iocget_option(esk,
+			(struct evl_net_sockopt __user *)arg);
 		break;
 	default:
 		ret = -ENOTTY;
@@ -633,44 +788,19 @@ __poll_t sock_oob_poll(struct file *filp,
 	return esk->proto->oob_poll(esk, wait);
 }
 
-static int socket_set_rmem(struct evl_socket *esk, int __user *u_val)
-{
-	int ret, val;
-
-	ret = raw_get_user(val, u_val);
-	if (ret)
-		return -EFAULT;
-
-	/* Same logic as __sock_set_rcvbuf(). */
-	val = min_t(int, val, INT_MAX / 2);
-	WRITE_ONCE(esk->rmem_max, max_t(int, val * 2, SOCK_MIN_RCVBUF));
-
-	return 0;
-}
-
-static int socket_set_wmem(struct evl_socket *esk, int __user *u_val)
-{
-	int ret, val;
-
-	ret = raw_get_user(val, u_val);
-	if (ret)
-		return -EFAULT;
-
-	val = min_t(int, val, INT_MAX / 2);
-	WRITE_ONCE(esk->wmem_max, max_t(int, val * 2, SOCK_MIN_SNDBUF));
-
-	return 0;
-}
-
-static int sock_inband_ioctl(struct socket *sock, unsigned int cmd,
+static long sock_inband_ioctl(struct sock *sk, unsigned int cmd,
 			unsigned long arg)
 {
-	struct sock *sk = sock->sk;
-	struct evl_socket *esk = sk->oob_data;
+	struct evl_socket *esk = evl_sk(sk);
 	struct evl_netdev_activation act, __user *u_act;
-	int __user *u_val;
+	struct evl_net_solicit solreq, __user *u_solreq;
 	int ret;
 
+	/*
+	 * We leave EVL_SOCKIOC_SET/GETOPT to be handled via the
+	 * set/getsockopt() redirection. I.e. any direct ioctl()
+	 * request from the inband stage for those would fail.
+	 */
 	switch (cmd) {
 	case EVL_SOCKIOC_ACTIVATE: /* Turn oob port on. */
 		u_act = (typeof(u_act))arg;
@@ -682,13 +812,16 @@ static int sock_inband_ioctl(struct socket *sock, unsigned int cmd,
 	case EVL_SOCKIOC_DEACTIVATE: /* Turn oob port off. */
 		ret = evl_net_switch_oob_port(esk, NULL);
  		break;
-	case EVL_SOCKIOC_SETRECVSZ:
-		u_val = (typeof(u_val))arg;
-		ret = socket_set_rmem(esk, u_val);
-		break;
-	case EVL_SOCKIOC_SETSENDSZ:
-		u_val = (typeof(u_val))arg;
-		ret = socket_set_wmem(esk, u_val);
+	case EVL_SOCKIOC_SOLICIT:
+		u_solreq = (typeof(u_solreq))arg;
+		ret = copy_from_user(&solreq, u_solreq, sizeof(solreq));
+		if (ret)
+			return -EFAULT;
+		ret = -ENOTSUPP;
+		if (esk->proto->solicit)
+			ret = esk->proto->solicit(esk,
+				(struct sockaddr *)&solreq.addr,
+				solreq.flags);
 		break;
 	default:
 		ret = -ENOTTY;
@@ -706,27 +839,95 @@ static int sock_inband_ioctl(struct socket *sock, unsigned int cmd,
  * EVL-specific command, we should return -ENOIOCTLCMD to the caller,
  * so that it tries harder to find a suitable handler.
  */
-long sock_inband_ioctl_redirect(struct socket *sock, /* in-band hook */
+long sock_inband_ioctl_redirect(struct sock *sk, /* in-band hook */
 				unsigned int cmd, unsigned long arg)
 {
-	long ret = sock_inband_ioctl(sock, cmd, arg);
+	long ret = sock_inband_ioctl(sk, cmd, arg);
 
 	return ret == -ENOTTY ? -ENOIOCTLCMD : ret;
 }
 
+/* setsockopt() redirector. */
+int sock_inband_setopt_redirect(struct sock *sk,
+				int level, int optname,
+				sockptr_t optval, unsigned int optlen)
+{
+	struct evl_socket *esk = evl_sk(sk);
+
+	if (optval.is_kernel)
+		/* Sorry mate, won't deal with intra-kernel requests. */
+		return -ENOTSUPP;
+
+	if (level != SOL_SOCKET)
+		/* We don't implement protocol-specific options (yet). */
+		return -ENOIOCTLCMD;
+
+	switch (optname) {
+	case SO_TIMESTAMP_OOB:
+		return socket_set_timestamping(esk, optval.user, optlen);
+	}
+
+	/*
+	 * We don't know this option, tell the caller to forward the
+	 * request to the common command demultiplexer.
+	 */
+	return -ENOIOCTLCMD;
+}
+
+/* getsockopt() redirector. */
+int sock_inband_getopt_redirect(struct sock *sk,
+				int level, int optname,
+				sockptr_t optval, int *optlen)
+{
+	struct evl_socket *esk = evl_sk(sk);
+
+	if (optval.is_kernel)
+		return -ENOTSUPP;
+
+	if (level != SOL_SOCKET)
+		return -ENOIOCTLCMD;
+
+	switch (optname) {
+	case SO_TIMESTAMP_OOB:
+		return socket_get_timestamping(esk, optval.user, optlen);
+	}
+
+	return -ENOIOCTLCMD;
+}
+
+static int evl_sock_ioctl(struct socket *sock, unsigned int cmd,
+			unsigned long arg)
+{
+	return sock_inband_ioctl(sock->sk, cmd, arg);
+}
+
 static int evl_sock_bind(struct socket *sock, struct sockaddr *u_addr, int len)
 {
-	struct evl_socket *esk = evl_sk(sock);
+	struct evl_socket *esk = evl_sk(sock->sk);
 
 	return esk->proto->bind(esk, u_addr, len);
+}
+
+static int evl_sock_connect(struct socket *sock,
+			struct sockaddr *u_addr, int len, int flags)
+{
+	struct evl_socket *esk = evl_sk(sock->sk);
+
+	return esk->proto->connect(esk, u_addr, len, flags);
+}
+
+static int evl_sock_shutdown(struct socket *sock, int how)
+{
+	struct evl_socket *esk = evl_sk(sock->sk);
+
+	return esk->proto->shutdown(esk, how);
 }
 
 static int evl_sock_release(struct socket *sock)
 {
 	/*
-	 * Cleanup happens from sock_oob_detach(), so that PF_OOB
-	 * and common protocols sockets we piggybacked on are
-	 * released.
+	 * Cleanup happens from sock_oob_destroy(), so that PF_OOB and
+	 * common protocols sockets we piggybacked on are released.
 	 */
 	return 0;
 }
@@ -736,17 +937,16 @@ static const struct proto_ops netproto_ops = {
 	.owner =	THIS_MODULE,
 	.release =	evl_sock_release,
 	.bind =		evl_sock_bind,
-	.connect =	sock_no_connect,
+	.connect =	evl_sock_connect,
+	.shutdown =	evl_sock_shutdown,
+	.ioctl =	evl_sock_ioctl,
 	.socketpair =	sock_no_socketpair,
 	.accept =	sock_no_accept,
 	.getname =	sock_no_getname,
-	.ioctl =	sock_inband_ioctl,
 	.listen =	sock_no_listen,
-	.shutdown =	sock_no_shutdown,
 	.sendmsg =	sock_no_sendmsg,
 	.recvmsg =	sock_no_recvmsg,
 	.mmap =		sock_no_mmap,
-	.sendpage =	sock_no_sendpage,
 };
 
 /*
@@ -765,12 +965,10 @@ static void destroy_evl_socket(struct sock *sk)
 	local_bh_disable();
 	sock_prot_inuse_add(sock_net(sk), sk->sk_prot, -1);
 	local_bh_enable();
-
-	sk_refcnt_debug_dec(sk);
 }
 
 static int create_evl_socket(struct net *net, struct socket *sock,
-			int protocol, int kern)
+			     int protocol, int kern)
 {
 	struct sock *sk;
 
@@ -790,8 +988,7 @@ static int create_evl_socket(struct net *net, struct socket *sock,
 	 * Protocol is checked for validity when the socket is
 	 * attached to the out-of-band core in sock_oob_attach().
 	 */
-	sk->sk_protocol = protocol;
-	sk_refcnt_debug_inc(sk);
+	sk->sk_protocol = htons(protocol);
 	sk->sk_destruct	= destroy_evl_socket;
 
 	local_bh_disable();

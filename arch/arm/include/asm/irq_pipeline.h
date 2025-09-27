@@ -13,12 +13,13 @@
 /*
  * In order to cope with the limited number of SGIs available to us,
  * In-band IPI messages are multiplexed over SGI0, whereas out-of-band
- * IPIs are directly mapped to SGI1-2.
+ * IPIs are directly mapped to SGI1-3.
  */
-#define OOB_NR_IPI		2
+#define OOB_NR_IPI		3
 #define OOB_IPI_OFFSET		1 /* SGI1 */
 #define TIMER_OOB_IPI		(ipi_irq_base + OOB_IPI_OFFSET)
 #define RESCHEDULE_OOB_IPI	(TIMER_OOB_IPI + 1)
+#define CALL_FUNCTION_OOB_IPI	(RESCHEDULE_OOB_IPI + 1)
 
 extern int ipi_irq_base;
 
@@ -104,6 +105,10 @@ static inline void arch_handle_irq_pipelined(struct pt_regs *regs)
 	do {							\
 		to_svc_pt_regs(__regs)->irqstate = __irqstate;	\
 	} while (0)
+
+int handle_arch_irq_pipelined(struct pt_regs *regs);
+
+void arm_preempt_schedule_irq(void);
 
 #else /* !CONFIG_IRQ_PIPELINE */
 

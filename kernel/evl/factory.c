@@ -23,14 +23,15 @@
 #include <linux/file.h>
 #include <linux/capability.h>
 #include <linux/cred.h>
+#include <linux/kthread.h>
+#include <linux/wait.h>
 #include <linux/dovetail.h>
 #include <evl/assert.h>
 #include <evl/file.h>
 #include <evl/control.h>
-#include <evl/syscall.h>
 #include <evl/factory.h>
 #include <evl/uaccess.h>
-#include <uapi/evl/factory.h>
+#include <uapi/evl/syscall-abi.h>
 
 static struct class *evl_class;
 
@@ -46,6 +47,10 @@ static struct evl_factory *factories[] = {
 	&evl_xbuf_factory,
 	&evl_proxy_factory,
 	&evl_observable_factory,
+	&evl_rng_factory,
+#ifdef CONFIG_EVL_NET
+	&evl_net_factory,
+#endif
 #ifdef CONFIG_FTRACE
 	&evl_trace_factory,
 #endif
@@ -55,6 +60,12 @@ static struct evl_factory *factories[] = {
 	(ARRAY_SIZE(early_factories) + ARRAY_SIZE(factories))
 
 static dev_t factory_rdev;
+
+static struct task_struct flusher_kthread;
+
+static wait_queue_head_t flusher_wait;
+
+static LIST_HEAD(flusher_queue);
 
 int evl_init_element(struct evl_element *e,
 		struct evl_factory *fac, int clone_flags)
@@ -154,20 +165,10 @@ static struct evl_element *unbind_file_from_element(struct file *filp)
 }
 
 /*
- * Multiple files may reference a single element on open().
- *
- * e->refs tracks the outstanding references to the element, saturates
- * to zero in evl_open_element(), which might race with
- * evl_put_element() for the same element. If the refcount is zero on
- * entry, evl_open_element() knows that __evl_put_element() is
- * scheduling a deletion of @e, returning -ESTALE if so.
- *
- * evl_open_element() is protected against referencing stale memory
- * enclosing all potentially unsafe references to @e into a read-side
- * RCU section. Meanwhile we wait for all read-sides to complete after
- * calling cdev_del().  Once cdev_del() returns, the device cannot be
- * opened anymore, which does not affect the files that might still be
- * active on this device though.
+ * evl_open_element() might race with __do_put_element() for the same
+ * element before the backing device is removed. If the refcount is
+ * zero on entry, evl_open_element() knows that __evl_put_element() is
+ * about to delete @e, returns -ESTALE if so.
  */
 int evl_open_element(struct inode *inode, struct file *filp)
 {
@@ -175,18 +176,8 @@ int evl_open_element(struct inode *inode, struct file *filp)
 	int ret = 0;
 
 	e = container_of(inode->i_cdev, struct evl_element, cdev);
-
-	rcu_read_lock();
-
-	if (!refcount_read(&e->refs))
-		ret = -ESTALE;
-	else
-		evl_get_element(e);
-
-	rcu_read_unlock();
-
-	if (ret)
-		return ret;
+	if (!__evl_get_element(e))
+		return -ESTALE;
 
 	ret = bind_file_to_element(filp, e);
 	if (ret) {
@@ -198,6 +189,7 @@ int evl_open_element(struct inode *inode, struct file *filp)
 
 	return 0;
 }
+EXPORT_SYMBOL_GPL(evl_open_element);
 
 static void __do_put_element(struct evl_element *e)
 {
@@ -207,68 +199,91 @@ static void __do_put_element(struct evl_element *e)
 	 * We might get there device-less if create_element_device()
 	 * failed installing a file descriptor for a private
 	 * element. Go to disposal immediately if so.
-	 */
-	if (unlikely(!e->dev))
-		goto dispose;
-
-	/*
-	 * e->minor won't be free for use until evl_destroy_element()
-	 * is called from the disposal handler, so there is no risk of
-	 * reusing it too early.
-	 */
-	evl_remove_element_device(e);
-
-	/*
-	 * Serialize with evl_open_element().
-	 */
-	synchronize_rcu();
-
-	/*
+	 *
 	 * CAUTION: the disposal handler should delay the release of
-	 * e's container at the next rcu idle period via kfree_rcu(),
+	 * @e's container at the next rcu idle period via kfree_rcu(),
 	 * because the embedded e->cdev is still needed ahead for
 	 * completing the file release process of public elements (see
 	 * __fput()).
 	 */
-dispose:
+	if (likely(e->dev))
+		evl_remove_element_device(e);
+
+	/*
+	 * e->minor is not reusable until evl_destroy_element() is
+	 * called from the disposal handler, so there is no risk of
+	 * reusing it too early.
+	 */
 	fac->dispose(e);
-}
-
-static void do_put_element_work(struct work_struct *work)
-{
-	struct evl_element *e;
-
-	e = container_of(work, struct evl_element, work);
-	__do_put_element(e);
 }
 
 static void do_put_element_irq(struct irq_work *work)
 {
 	struct evl_element *e;
+	unsigned long flags;
 
 	e = container_of(work, struct evl_element, irq_work);
-	INIT_WORK(&e->work, do_put_element_work);
-	schedule_work(&e->work);
+
+	/*
+	 * Queue the flushable element then wake the flusher up if
+	 * need be.
+	 */
+	spin_lock_irqsave(&flusher_wait.lock, flags);
+
+	list_add(&e->flush, &flusher_queue);
+	if (list_is_singular(&flusher_queue))
+		wake_up_locked(&flusher_wait);
+
+	spin_unlock_irqrestore(&flusher_wait.lock, flags);
 }
 
 void __evl_put_element(struct evl_element *e)
 {
 	/*
-	 * These trampolines may look like a bit cheesy but we have no
-	 * choice but offloading the disposal to an in-band task
-	 * context. In (the rare) case the last ref. to an element was
-	 * dropped from OOB(-protected) context or while hard irqs
-	 * were off, we need to go via an irq_work->workqueue chain in
-	 * order to run __do_put_element() eventually.
+	 * Element disposal is a bit tricky:
 	 *
-	 * NOTE: irq_work_queue() does not synchronize the interrupt
-	 * log when called with hard irqs off.
+	 * 1. this must happen from an inband task context which is
+	 * NOT a work queue callback since dispose() handlers might
+	 * want to call flush_work(), which might in turn lead to a
+	 * deadlock in the workqueue synchronization code if so. Our
+	 * flusher kthread provides such workqueue-independent task
+	 * context when the disposal routine runs from a work handler.
+	 *
+	 * 2. however, we want dependent create->delete->create
+	 * sequences to be preserved when issued from the same context
+	 * on any given CPU, e.g. the following must work:
+	 *
+	 * struct evl_clone_req req = { .name_ptr = __evl_ptr64("foo") };
+	 * CPU0: ioctl(..., EVL_IOC_CLONE, &req);
+	 * CPU0: close(req.efd);
+	 * CPU0: efd = ioctl(..., EVL_IOC_CLONE, &req);
+	 *
+	 * In this case, the disposal request never runs from a worker
+	 * context, so we can and must call dispose() immediately from
+	 * the calling context to provide the guarantee above
+	 * (i.e. fully synchronous path).
+	 *
+	 * 3. the last reference to an element might be dropped either
+	 * from oob context or inband while hard irqs are off. To
+	 * address this we need an irq work trampoline for queuing the
+	 * element to the flush queue. Note that irq_work_queue() does
+	 * not synchronize the interrupt log when called with hard
+	 * irqs off.
 	 */
 	if (unlikely(running_oob() || hard_irqs_disabled())) {
 		init_irq_work(&e->irq_work, do_put_element_irq);
 		irq_work_queue(&e->irq_work);
 	} else {
-		__do_put_element(e);
+		/*
+		 * If the calling context is a workqueue worker, we
+		 * must go through the flusher kthread to prevent any
+		 * workqueue synchronization woes. Otherwise, we may
+		 * (and must) run the disposal code directly.
+		 */
+		if (current_work())
+			do_put_element_irq(&e->irq_work);
+		else
+			__do_put_element(e);
 	}
 }
 EXPORT_SYMBOL_GPL(__evl_put_element);
@@ -282,6 +297,7 @@ int evl_release_element(struct inode *inode, struct file *filp)
 
 	return 0;
 }
+EXPORT_SYMBOL_GPL(evl_release_element);
 
 static void release_sys_device(struct device *dev)
 {
@@ -336,9 +352,9 @@ static int do_element_visibility(struct evl_element *e,
 		e->clone_flags |= EVL_CLONE_COREDEV;
 
 	/*
-	 * Unlike a private one, a publically visible element exports
-	 * a cdev in the /dev/evl hierarchy so that any process can
-	 * see it.  Both types are backed by a kernel device object so
+	 * Unlike a private one, a publicly visible element exports a
+	 * cdev in the /dev/evl hierarchy so that any process can see
+	 * it.  Both types are backed by a kernel device object so
 	 * that we can export their state to userland via /sysfs.
 	 */
 
@@ -483,9 +499,9 @@ fail_visibility:
 	return ret;
 }
 
-int evl_create_core_element_device(struct evl_element *e,
-				struct evl_factory *fac,
-				const char *name)
+int evl_create_element_device(struct evl_element *e,
+			struct evl_factory *fac,
+			const char *name)
 {
 	struct filename *devname;
 
@@ -500,6 +516,7 @@ int evl_create_core_element_device(struct evl_element *e,
 
 	return create_element_device(e, fac);
 }
+EXPORT_SYMBOL_GPL(evl_create_element_device);
 
 void evl_remove_element_device(struct evl_element *e)
 {
@@ -710,7 +727,7 @@ __evl_get_element_by_fundle(struct evl_index *map, fundle_t fundle)
 	return rb ? e : NULL;
 }
 
-static char *factory_type_devnode(struct device *dev, umode_t *mode,
+static char *factory_type_devnode(const struct device *dev, umode_t *mode,
 			kuid_t *uid, kgid_t *gid)
 {
 	struct evl_element *e;
@@ -740,7 +757,7 @@ static int create_element_class(struct evl_factory *fac)
 	if (fac->minor_map == NULL)
 		return ret;
 
-	class = class_create(THIS_MODULE, fac->name);
+	class = class_create(fac->name);
 	if (IS_ERR(class)) {
 		ret = PTR_ERR(class);
 		goto cleanup_minor;
@@ -773,7 +790,7 @@ static void delete_element_class(struct evl_factory *fac)
 	bitmap_free(fac->minor_map);
 }
 
-int evl_create_factory(struct evl_factory *fac, dev_t rdev)
+static int create_factory(struct evl_factory *fac, dev_t rdev)
 {
 	const char *idevname = "clone"; /* Initial device in factory. */
 	struct device *dev = NULL;
@@ -820,9 +837,8 @@ fail_cdev:
 
 	return ret;
 }
-EXPORT_SYMBOL_GPL(evl_create_factory);
 
-void evl_delete_factory(struct evl_factory *fac)
+static void delete_factory(struct evl_factory *fac)
 {
 	struct device *dev = fac->dev;
 
@@ -834,7 +850,6 @@ void evl_delete_factory(struct evl_factory *fac)
 	if (!(fac->flags & EVL_FACTORY_SINGLE))
 		delete_element_class(fac);
 }
-EXPORT_SYMBOL_GPL(evl_delete_factory);
 
 bool evl_may_access_factory(struct evl_factory *fac)
 {
@@ -844,18 +859,51 @@ bool evl_may_access_factory(struct evl_factory *fac)
 }
 EXPORT_SYMBOL_GPL(evl_may_access_factory);
 
-static char *evl_devnode(struct device *dev, umode_t *mode)
+static char *evl_devnode(const struct device *dev, umode_t *mode)
 {
 	return kasprintf(GFP_KERNEL, "evl/%s", dev_name(dev));
 }
 
-static int __init
-create_core_factories(struct evl_factory **factories, int nr)
+static int factory_flusher(void *arg)
+{
+	struct wait_queue_entry wq_entry;
+	struct evl_element *e, *tmp;
+	unsigned long flags;
+	LIST_HEAD(list);
+
+	init_wait_entry(&wq_entry, 0);
+
+	for (;;) {
+		if (kthread_should_stop())
+			break;
+
+		spin_lock_irqsave(&flusher_wait.lock, flags);
+
+		if (!list_empty(&flusher_queue)) {
+			list_splice_init(&flusher_queue, &list);
+			spin_unlock_irqrestore(&flusher_wait.lock, flags);
+			list_for_each_entry_safe(e, tmp, &list, flush) {
+				list_del(&e->flush);
+				__do_put_element(e);
+			}
+		} else {
+			if (list_empty(&wq_entry.entry))
+				__add_wait_queue(&flusher_wait, &wq_entry);
+			set_current_state(TASK_INTERRUPTIBLE);
+			spin_unlock_irqrestore(&flusher_wait.lock, flags);
+			schedule();
+		}
+	}
+
+	return 0;
+}
+
+static int create_core_factories(struct evl_factory **factories, int nr)
 {
 	int ret, n;
 
 	for (n = 0; n < nr; n++) {
-		ret = evl_create_factory(factories[n],
+		ret = create_factory(factories[n],
 				MKDEV(MAJOR(factory_rdev), n));
 		if (ret)
 			goto fail;
@@ -864,25 +912,48 @@ create_core_factories(struct evl_factory **factories, int nr)
 	return 0;
 fail:
 	while (n-- > 0)
-		evl_delete_factory(factories[n]);
+		delete_factory(factories[n]);
 
 	return ret;
 }
 
-static void __init
-delete_core_factories(struct evl_factory **factories, int nr)
+static void delete_core_factories(struct evl_factory **factories, int nr)
 {
 	int n;
 
 	for (n = 0; n < nr; n++)
-		evl_delete_factory(factories[n]);
+		delete_factory(factories[n]);
 }
 
-int __init evl_early_init_factories(void)
+int evl_create_factory(struct evl_factory *fac)
 {
 	int ret;
 
-	evl_class = class_create(THIS_MODULE, "evl");
+	ret = alloc_chrdev_region(&fac->sub_rdev, 0, 1, fac->name);
+	if (ret)
+		return ret;;
+
+	ret = create_factory(fac, MKDEV(MAJOR(fac->sub_rdev), 0));
+	if (ret)
+		unregister_chrdev_region(fac->sub_rdev, 1);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(evl_create_factory);
+
+void evl_delete_factory(struct evl_factory *fac)
+{
+	unregister_chrdev_region(fac->sub_rdev, 1);
+	delete_factory(fac);
+}
+EXPORT_SYMBOL_GPL(evl_delete_factory);
+
+int __init evl_early_init_factories(void)
+{
+	struct task_struct *p;
+	int ret;
+
+	evl_class = class_create("evl");
 	if (IS_ERR(evl_class))
 		return PTR_ERR(evl_class);
 
@@ -890,17 +961,29 @@ int __init evl_early_init_factories(void)
 
 	ret = alloc_chrdev_region(&factory_rdev, 0, NR_FACTORIES,
 				"evl_factory");
-	if (ret) {
-		class_destroy(evl_class);
-		return ret;
+	if (ret)
+		goto fail_region;
+
+	init_waitqueue_head(&flusher_wait);
+	p = kthread_run(factory_flusher, &flusher_kthread, "evl_flusher");
+	if (IS_ERR(p)) {
+		ret = PTR_ERR(p);
+		goto fail_kthread;
 	}
 
 	ret = create_core_factories(early_factories,
 			ARRAY_SIZE(early_factories));
-	if (ret) {
-		unregister_chrdev_region(factory_rdev, NR_FACTORIES);
-		class_destroy(evl_class);
-	}
+	if (ret)
+		goto fail_factories;
+
+	return 0;
+
+fail_factories:
+	kthread_stop(&flusher_kthread);
+fail_kthread:
+	unregister_chrdev_region(factory_rdev, NR_FACTORIES);
+fail_region:
+	class_destroy(evl_class);
 
 	return ret;
 }
@@ -909,6 +992,8 @@ void __init evl_early_cleanup_factories(void)
 {
 	delete_core_factories(early_factories, ARRAY_SIZE(early_factories));
 	unregister_chrdev_region(factory_rdev, NR_FACTORIES);
+	kthread_stop(&flusher_kthread);
+	wake_up(&flusher_wait);
 	class_destroy(evl_class);
 }
 

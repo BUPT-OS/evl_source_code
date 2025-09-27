@@ -290,24 +290,23 @@ fail0:
 	return status;
 }
 
-static int __exit omap_cf_remove(struct platform_device *pdev)
+static void __exit omap_cf_remove(struct platform_device *pdev)
 {
 	struct omap_cf_socket *cf = platform_get_drvdata(pdev);
 
 	cf->active = 0;
 	pcmcia_unregister_socket(&cf->socket);
-	del_timer_sync(&cf->timer);
+	timer_shutdown_sync(&cf->timer);
 	release_mem_region(cf->phys_cf, SZ_8K);
 	free_irq(cf->irq, cf);
 	kfree(cf);
-	return 0;
 }
 
 static struct platform_driver omap_cf_driver = {
 	.driver = {
 		.name	= driver_name,
 	},
-	.remove		= __exit_p(omap_cf_remove),
+	.remove_new	= __exit_p(omap_cf_remove),
 };
 
 static int __init omap_cf_init(void)

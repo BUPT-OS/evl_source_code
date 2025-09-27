@@ -15,15 +15,14 @@
 #include <linux/spinlock.h>
 #include <linux/rbtree.h>
 #include <linux/rcupdate.h>
-#include <linux/workqueue.h>
 #include <linux/irq_work.h>
 #include <linux/mutex.h>
 #include <linux/hashtable.h>
 #include <linux/refcount.h>
 #include <evl/assert.h>
 #include <evl/file.h>
-#include <uapi/evl/types.h>
-#include <uapi/evl/factory.h>
+#include <uapi/evl/types-abi.h>
+#include <uapi/evl/factory-abi.h>
 
 #define element_of(__filp, __type)					\
 	({								\
@@ -81,12 +80,11 @@ struct evl_element {
 	struct filename *devname;
 	unsigned int minor;
 	refcount_t refs;
-	bool zombie;
 	fundle_t fundle;
 	int clone_flags;
 	struct rb_node index_node;
 	struct irq_work irq_work;
-	struct work_struct work;
+	struct list_head flush;
 	struct hlist_node hash;
 	struct {
 		struct file *filp;
@@ -114,10 +112,15 @@ int evl_init_user_element(struct evl_element *e,
 
 void evl_destroy_element(struct evl_element *e);
 
+static inline bool __evl_get_element(struct evl_element *e)
+{
+	return refcount_inc_not_zero(&e->refs);
+}
+
 static inline void evl_get_element(struct evl_element *e)
 {
-	bool ret = refcount_inc_not_zero(&e->refs);
-	EVL_WARN_ON(CORE, !ret);
+	bool ret = !__evl_get_element(e);
+	EVL_WARN_ON(CORE, ret);
 }
 
 struct evl_element *
@@ -185,9 +188,9 @@ int evl_open_element(struct inode *inode,
 int evl_release_element(struct inode *inode,
 			struct file *filp);
 
-int evl_create_core_element_device(struct evl_element *e,
-				struct evl_factory *fac,
-				const char *name);
+int evl_create_element_device(struct evl_element *e,
+			struct evl_factory *fac,
+			const char *name);
 
 void evl_remove_element_device(struct evl_element *e);
 
@@ -207,7 +210,7 @@ static inline void evl_unindex_factory_element(struct evl_element *e)
 	evl_unindex_element(&e->factory->index, e);
 }
 
-int evl_create_factory(struct evl_factory *fac, dev_t rdev);
+int evl_create_factory(struct evl_factory *fac);
 
 void evl_delete_factory(struct evl_factory *fac);
 
@@ -230,5 +233,7 @@ extern struct evl_factory evl_trace_factory;
 extern struct evl_factory evl_xbuf_factory;
 extern struct evl_factory evl_proxy_factory;
 extern struct evl_factory evl_observable_factory;
+extern struct evl_factory evl_rng_factory;
+extern struct evl_factory evl_net_factory;
 
 #endif /* !_EVL_FACTORY_H */

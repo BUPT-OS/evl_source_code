@@ -13,7 +13,7 @@
 #include <linux/tick.h>
 #include <evl/clock.h>
 #include <evl/sched.h>
-#include <uapi/evl/types.h>
+#include <uapi/evl/types-abi.h>
 
 struct evl_rq;
 

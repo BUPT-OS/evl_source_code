@@ -8,7 +8,7 @@
 #define _EVL_DEVICES_GPIO_H
 
 #include <evl/device.h>
-#include <uapi/evl/devices/gpio.h>
+#include <uapi/evl/devices/gpio-abi.h>
 
 #ifdef CONFIG_EVL
 

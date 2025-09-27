@@ -31,6 +31,18 @@ int inband_irqs_disabled(void);
 #define hard_irqs_disabled()			native_irqs_disabled()
 #define hard_irqs_disabled_flags(__flags)	native_irqs_disabled_flags(__flags)
 
+#ifdef CONFIG_NET_OOB
+#define hard_net_local_irq_enable()		hard_local_irq_enable()
+#define hard_net_local_irq_disable()		hard_local_irq_disable()
+#define hard_net_local_irq_save()		hard_local_irq_save()
+#define hard_net_local_irq_restore(__flags)	hard_local_irq_restore(__flags)
+#else
+#define hard_net_local_irq_enable()		do { } while(0)
+#define hard_net_local_irq_disable()		do { } while(0)
+#define hard_net_local_irq_save()		0
+#define hard_net_local_irq_restore(__flags)	do { (void)(__flags); } while(0)
+#endif
+
 void irq_pipeline_nmi_enter(void);
 void irq_pipeline_nmi_exit(void);
 
@@ -54,6 +66,21 @@ void irq_pipeline_nmi_exit(void);
 
 #define hard_local_irq_sync()			native_irq_sync()
 
+bool stage_disabled(void);
+
+bool stage_disabled_flags(unsigned long irqstate, bool *stalled);
+
+unsigned long test_and_lock_stage(int *irqsoff);
+
+void unlock_stage(unsigned long irqstate);
+
+#define stage_save_flags(__irqstate)					\
+  	do {								\
+	  unsigned long __flags = hard_local_save_flags();		\
+	  (__irqstate) = irqs_merge_flags(__flags,			\
+					  irqs_disabled());		\
+	} while (0)
+
 #else /* !CONFIG_IRQ_PIPELINE */
 
 #define hard_local_save_flags()			({ unsigned long __flags; \
@@ -69,6 +96,11 @@ void irq_pipeline_nmi_exit(void);
 #define hard_cond_local_irq_save()		0
 #define hard_cond_local_irq_restore(__flags)	do { (void)(__flags); } while(0)
 
+#define hard_net_local_irq_enable()		do { } while(0)
+#define hard_net_local_irq_disable()		do { } while(0)
+#define hard_net_local_irq_save()		0
+#define hard_net_local_irq_restore(__flags)	do { (void)(__flags); } while(0)
+
 #define hard_irqs_disabled()			irqs_disabled()
 #define hard_irqs_disabled_flags(__flags)	raw_irqs_disabled_flags(__flags)
 
@@ -76,6 +108,26 @@ static inline void irq_pipeline_nmi_enter(void) { }
 static inline void irq_pipeline_nmi_exit(void) { }
 
 #define hard_local_irq_sync()			do { } while (0)
+
+#define stage_disabled()			irqs_disabled()
+
+#define stage_disabled_flags(__flags, __stalled)		\
+	({							\
+		(*__stalled) = irqs_disabled_flags(__flags);	\
+		(*__stalled);					\
+	})
+
+#define test_and_lock_stage(__irqsoff)				\
+	({							\
+		unsigned long __flags;				\
+		raw_local_irq_save(__flags);			\
+		*(__irqsoff) = irqs_disabled_flags(__flags);	\
+		__flags;					\
+	})
+
+#define unlock_stage(__flags)		raw_local_irq_restore(__flags)
+
+#define stage_save_flags(__flags)	raw_local_save_flags(__flags)
 
 #endif /* !CONFIG_IRQ_PIPELINE */
 

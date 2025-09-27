@@ -1,4 +1,4 @@
-obj-$(CONFIG_EVL) += evl.o sched/ net/
+obj-$(CONFIG_EVL) += evl.o sched/ lib/ net/
 
 evl-y :=		\
 	clock.o		\
@@ -12,6 +12,7 @@ evl-y :=		\
 	observable.o	\
 	poll.o		\
 	proxy.o		\
+	random.o	\
 	sem.o		\
 	stax.o		\
 	syscall.o	\

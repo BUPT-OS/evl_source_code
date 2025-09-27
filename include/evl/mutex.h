@@ -15,7 +15,6 @@
 #include <evl/timer.h>
 #include <evl/wait.h>
 #include <evl/sched.h>
-#include <uapi/evl/mutex.h>
 
 struct evl_clock;
 struct evl_thread;
@@ -34,7 +33,7 @@ struct evl_thread;
 struct evl_mutex {
 	atomic_t *fastlock;
 	int flags;
-	u32 *ceiling_ref;
+	u32 *ceiling_addr;
 	struct evl_wait_channel wchan;
 	struct list_head next_booster; /* thread->boosters */
 	struct list_head next_owned;   /* thread->owned_mutexes */
@@ -49,20 +48,21 @@ struct evl_mutex {
 void __evl_init_mutex(struct evl_mutex *mutex,
 		struct evl_clock *clock,
 		atomic_t *fastlock,
-		u32 *ceiling_ref,
-		const char *name);
+		u32 *ceiling,
+		const char *name,
+		struct lock_class_key *lock_key);
 
-#define evl_init_named_mutex_pi(__mutex, __clock, __fastlock, __name)	\
-	__evl_init_mutex(__mutex, __clock, __fastlock, NULL, __name)
+#define evl_init_mutex(__mutex, __clock, __fastlock, __ceiling)		\
+	do {								\
+		static struct lock_class_key key;			\
+		__evl_init_mutex(__mutex, __clock, __fastlock, __ceiling, #__mutex, &key); \
+	} while (0)
 
 #define evl_init_mutex_pi(__mutex, __clock, __fastlock)			\
-	evl_init_named_mutex_pi(__mutex, __clock, __fastlock, #__mutex)
-
-#define evl_init_named_mutex_pp(__mutex, __clock, __fastlock, __ceiling, __name) \
-	__evl_init_mutex(__mutex, __clock, __fastlock, __ceiling, __name)
+	evl_init_mutex(__mutex, __clock, __fastlock, NULL)
 
 #define evl_init_mutex_pp(__mutex, __clock, __fastlock, __ceiling)	\
-	evl_init_named_mutex_pp(__mutex, __clock, __fastlock, __ceiling, #__mutex)
+	evl_init_mutex(__mutex, __clock, __fastlock, __ceiling)
 
 void evl_destroy_mutex(struct evl_mutex *mutex);
 
@@ -92,6 +92,12 @@ bool evl_requeue_mutex_wait(struct evl_wait_channel *wchan,
 
 void evl_drop_current_ownership(void);
 
+static inline bool
+evl_is_mutex_owner(atomic_t *fastlock, fundle_t ownerh)
+{
+	return evl_get_index(atomic_read(fastlock)) == ownerh;
+}
+
 struct evl_kmutex {
 	struct evl_mutex mutex;
 	atomic_t fastlock;
@@ -102,7 +108,7 @@ struct evl_kmutex {
 			.fastlock = &(__name).fastlock,			\
 			.flags = EVL_MUTEX_PI,				\
 			.wprio = -1,					\
-			.ceiling_ref = NULL,				\
+			.ceiling_addr = NULL,				\
 			.clock = &evl_mono_clock,			\
 			.wchan = {					\
 				.lock = __HARD_SPIN_LOCK_INITIALIZER((__name).wchan.lock), \
@@ -156,7 +162,7 @@ static inline int evl_ceiling_priority(struct evl_mutex *mutex)
 	 * memory, make sure to constrain it within valid bounds for
 	 * evl_sched_fifo before using it.
 	 */
-	return clamp(*mutex->ceiling_ref, 1U, (u32)EVL_FIFO_MAX_PRIO);
+	return clamp(*mutex->ceiling_addr, 1U, (u32)EVL_FIFO_MAX_PRIO);
 }
 
 #endif /* !_EVL_MUTEX_H */

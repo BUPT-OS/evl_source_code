@@ -2,23 +2,45 @@
  * SPDX-License-Identifier: GPL-2.0
  *
  * Derived from Xenomai Cobalt, https://xenomai.org/
- * Copyright (C) 2001, 2019 Philippe Gerum  <rpm@xenomai.org>
+ * Copyright (C) 2001, 2019, 2022 Philippe Gerum  <rpm@xenomai.org>
+ * Copyright (C) 2008, 2009 Jan Kiszka <jan.kiszka@siemens.com>.
  */
 
 #include <linux/kernel.h>
 #include <evl/timer.h>
-#include <evl/clock.h>
-#include <evl/sched.h>
 #include <evl/thread.h>
 #include <evl/mutex.h>
-#include <evl/monitor.h>
-#include <evl/wait.h>
 #include <evl/lock.h>
-#include <uapi/evl/signal.h>
+#include <uapi/evl/signal-abi.h>
 #include <trace/events/evl.h>
 
 #define for_each_evl_mutex_waiter(__pos, __mutex)			\
 	list_for_each_entry(__pos, &(__mutex)->wchan.wait_list, wait_next)
+
+void __evl_init_mutex(struct evl_mutex *mutex,
+		struct evl_clock *clock,
+		atomic_t *fastlock, u32 *ceiling,
+		const char *name,
+		struct lock_class_key *lock_key)
+{
+	int type = ceiling ? EVL_MUTEX_PP : EVL_MUTEX_PI;
+
+	mutex->fastlock = fastlock;
+	atomic_set(fastlock, EVL_NO_HANDLE);
+	mutex->flags = type;
+	mutex->boost.wprio = -1;
+	mutex->boost.sched_class = NULL;
+	mutex->ceiling_addr = ceiling;
+	mutex->clock = clock;
+	mutex->wchan.owner = NULL;
+	mutex->wchan.requeue_wait = evl_requeue_mutex_wait;
+	mutex->wchan.name = name;
+	INIT_LIST_HEAD(&mutex->wchan.wait_list);
+	raw_spin_lock_init(&mutex->wchan.lock);
+	lockdep_set_class_and_name(&mutex->wchan.lock, lock_key, name);
+	might_hard_lock(&mutex->wchan.lock);
+}
+EXPORT_SYMBOL_GPL(__evl_init_mutex);
 
 /* mutex->wchan.lock held, irqs off. */
 static inline
@@ -261,33 +283,6 @@ void evl_check_no_mutex(void)
 		evl_notify_thread(curr, EVL_HMDIAG_LKDEPEND, evl_nil);
 }
 
-void __evl_init_mutex(struct evl_mutex *mutex,
-		struct evl_clock *clock,
-		atomic_t *fastlock, u32 *ceiling_ref,
-		const char *name)
-{
-	int type = ceiling_ref ? EVL_MUTEX_PP : EVL_MUTEX_PI;
-
-	mutex->fastlock = fastlock;
-	atomic_set(fastlock, EVL_NO_HANDLE);
-	mutex->flags = type;
-	mutex->boost.wprio = -1;
-	mutex->boost.sched_class = NULL;
-	mutex->ceiling_ref = ceiling_ref;
-	mutex->clock = clock;
-	mutex->wchan.owner = NULL;
-	mutex->wchan.requeue_wait = evl_requeue_mutex_wait;
-	mutex->wchan.name = name;
-	INIT_LIST_HEAD(&mutex->wchan.wait_list);
-	raw_spin_lock_init(&mutex->wchan.lock);
-#ifdef CONFIG_LOCKDEP
-	lockdep_register_key(&mutex->wchan.lock_key);
-	lockdep_set_class_and_name(&mutex->wchan.lock, &mutex->wchan.lock_key, name);
-	might_hard_lock(&mutex->wchan.lock);
-#endif
-}
-EXPORT_SYMBOL_GPL(__evl_init_mutex);
-
 /* mutex->wchan.lock held, irqs off */
 static void flush_mutex_locked(struct evl_mutex *mutex, int reason)
 {
@@ -332,7 +327,6 @@ void evl_destroy_mutex(struct evl_mutex *mutex)
 	untrack_mutex_owner(mutex);
 	raw_spin_unlock_irqrestore(&mutex->wchan.lock, flags);
 	evl_schedule();
-	lockdep_unregister_key(&mutex->wchan.lock_key);
 }
 EXPORT_SYMBOL_GPL(evl_destroy_mutex);
 

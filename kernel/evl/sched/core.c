@@ -19,12 +19,11 @@
 #include <evl/thread.h>
 #include <evl/timer.h>
 #include <evl/memory.h>
-#include <evl/clock.h>
 #include <evl/tick.h>
 #include <evl/monitor.h>
 #include <evl/mutex.h>
 #include <evl/flag.h>
-#include <uapi/evl/signal.h>
+#include <uapi/evl/signal-abi.h>
 #include <trace/events/evl.h>
 
 DEFINE_PER_CPU(struct evl_rq, evl_runqueues);
@@ -108,10 +107,10 @@ static void watchdog_handler(struct evl_timer *timer) /* oob stage stalled */
 		raw_spin_unlock(&curr->lock);
 		evl_notify_thread(curr, EVL_HMDIAG_WATCHDOG, evl_nil);
 		dovetail_send_mayday(current);
-		printk(EVL_WARNING "watchdog triggered on CPU #%d -- runaway thread "
+		printk(EVL_WARNING "watchdog triggered on CPU%d -- runaway thread "
 			"'%s' signaled\n", evl_rq_cpu(this_rq), curr->name);
 	} else {
-		printk(EVL_WARNING "watchdog triggered on CPU #%d -- runaway thread "
+		printk(EVL_WARNING "watchdog triggered on CPU%d -- runaway thread "
 			"'%s' canceled\n", evl_rq_cpu(this_rq), curr->name);
 		/*
 		 * On behalf on an IRQ handler, evl_cancel_thread()
@@ -133,11 +132,13 @@ static void watchdog_handler(struct evl_timer *timer) /* oob stage stalled */
 
 static void roundrobin_handler(struct evl_timer *timer) /* hard irqs off */
 {
-	struct evl_rq *this_rq;
+	struct evl_rq *this_rq = container_of(timer, struct evl_rq, rrbtimer);
 
-	this_rq = container_of(timer, struct evl_rq, rrbtimer);
 	raw_spin_lock(&this_rq->lock);
-	evl_sched_tick(this_rq);
+
+	if (this_rq->curr->state & EVL_T_RRB)
+		evl_sched_yield(this_rq);
+
 	raw_spin_unlock(&this_rq->lock);
 }
 
@@ -1159,7 +1160,7 @@ int evl_switch_oob(void)
 }
 EXPORT_SYMBOL_GPL(evl_switch_oob);
 
-void evl_switch_inband(int cause)
+void evl_switch_inband_details(int cause, union evl_value details)
 {
 	struct evl_thread *curr = evl_current();
 	struct evl_rq *this_rq;
@@ -1262,7 +1263,7 @@ void evl_switch_inband(int cause)
 		 * an HM event.
 		 */
 		if (curr->state & EVL_T_WOSS)
-			evl_notify_thread(curr, cause, evl_nil);
+			evl_notify_thread(curr, cause, details);
 
 		/* May check for locking inconsistency too. */
 		if (curr->state & EVL_T_WOLI)
@@ -1271,6 +1272,12 @@ void evl_switch_inband(int cause)
 
 	/* @curr is now running inband. */
 	evl_sync_uwindow(curr);
+}
+EXPORT_SYMBOL_GPL(evl_switch_inband_details);
+
+void evl_switch_inband(int cause)
+{
+	evl_switch_inband_details(cause, evl_nil);
 }
 EXPORT_SYMBOL_GPL(evl_switch_inband);
 

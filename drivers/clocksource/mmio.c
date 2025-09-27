@@ -14,7 +14,8 @@
 #include <linux/fs.h>
 #include <linux/mm.h>
 #include <linux/mman.h>
-#include <linux/device.h>
+#include <linux/cdev.h>
+#include <linux/vmalloc.h>
 
 struct clocksource_user_mapping {
 	struct mm_struct *mm;
@@ -514,7 +515,7 @@ static int __init mmio_clksrc_chr_dev_init(void)
 	struct class *class;
 	int err;
 
-	class = class_create(THIS_MODULE, "mmio_ucs");
+	class = class_create("mmio_ucs");
 	if (IS_ERR(class)) {
 		pr_err("couldn't create user mmio clocksources class\n");
 		return PTR_ERR(class);

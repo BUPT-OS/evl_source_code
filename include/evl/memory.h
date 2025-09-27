@@ -14,7 +14,7 @@
 #include <linux/rbtree.h>
 #include <evl/list.h>
 #include <evl/factory.h>
-#include <uapi/evl/types.h>
+#include <uapi/evl/types-abi.h>
 
 #define EVL_HEAP_PAGE_SHIFT	9 /* 2^9 => 512 bytes */
 #define EVL_HEAP_PAGE_SIZE	(1UL << EVL_HEAP_PAGE_SHIFT)

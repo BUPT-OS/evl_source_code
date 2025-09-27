@@ -57,6 +57,8 @@ void irq_send_oob_ipi(unsigned int ipi,
 
 void irq_pipeline_oops(void);
 
+bool irq_pipeline_can_idle(void);
+
 bool irq_cpuidle_enter(struct cpuidle_device *dev,
 		       struct cpuidle_state *state);
 
@@ -78,6 +80,22 @@ int handle_irq_pipelined_finish(struct irq_stage_data *prevd,
 int handle_irq_pipelined(struct pt_regs *regs);
 
 void sync_inband_irqs(void);
+
+void kentry_enter_pipelined(struct pt_regs *regs);
+
+void noinstr kentry_exit_pipelined(struct pt_regs *regs);
+
+static inline void irq_pipeline_idling_checks(void)
+{
+	if (irq_pipeline_debug()) {
+		WARN_ON_ONCE(!raw_irqs_disabled());
+		WARN_ON_ONCE(!hard_irqs_disabled());
+		WARN_ON_ONCE(stage_irqs_pending(this_inband_staged()));
+	}
+}
+
+bool irq_cpuidle_control(struct cpuidle_device *dev,
+			struct cpuidle_state *state);
 
 extern struct irq_domain *synthetic_irq_domain;
 
@@ -119,12 +137,18 @@ static inline bool inband_irq_pending(void)
 
 static inline void sync_inband_irqs(void) { }
 
-#endif /* !CONFIG_IRQ_PIPELINE */
+static inline bool irq_pipeline_can_idle(void)
+{
+	return true;
+}
 
-#if !defined(CONFIG_IRQ_PIPELINE) || !defined(CONFIG_SPARSE_IRQ)
-static inline void uncache_irq_desc(unsigned int irq) { }
-#else
-void uncache_irq_desc(unsigned int irq);
-#endif
+static inline void irq_pipeline_idling_checks(void) { }
+
+static inline int handle_irq_pipelined(struct pt_regs *regs)
+{
+	return 1;
+}
+
+#endif /* !CONFIG_IRQ_PIPELINE */
 
 #endif /* _LINUX_IRQ_PIPELINE_H */

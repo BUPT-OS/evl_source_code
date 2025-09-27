@@ -89,19 +89,19 @@ config EVL_RUNSTATS
 	the /sys interface.
 
 config EVL_NET
-        bool "Out-of-band networking (EXPERIMENTAL)"
+        bool "Out-of-band networking"
 	default n
 	select NET_OOB
 	select NET_SCHED
-	select NET_SCH_OOB
+	select BPF_OOB
 	select INET
 	select VLAN_8021Q
 	help
-	This option enables preliminary networking support for EVL.
+	This option enables out-of-band networking support for EVL.
 
-	CAUTION! This is WIP, experimental code with limited support
-	at the moment, which is still subject to significant UAPI and
-	kernel API changes all over the map.
+	The out-of-band network stack provides datagram-oriented
+	networking support to applications with real-time
+	communication requirements (UDP and raw packet protocols).
 
 menu "Fixed sizes and limits"
 
@@ -144,7 +144,7 @@ config EVL_NR_CLOCKS
 config EVL_NR_XBUFS
 	int "Maximum number of x-buffers"
 	range 1 16384
-	default 16
+	default 128
 	help
 
 	This value gives the maximum number of x-buffers which can be
@@ -161,19 +161,29 @@ config EVL_NR_PROXIES
 	applications.
 
 config EVL_NR_OBSERVABLES
-	int "Maximum number of observables"
-	range 1 16384
-	default 64
+       int "Maximum number of observables"
+       range 1 16384
+       default 64
+       help
+
+       This value gives the maximum number of observable elements
+       which can live concurrently in the EVL core. Observables enable
+       the observer design pattern, in which any number of observer
+       threads can be notified of updates to any number of observable
+       subjects, in a loosely coupled fashion. An EVL thread is in and
+       of itself an observable which can be monitored for events;
+       observables attached to threads are not accounted for in this
+       value.
+
+config EVL_NR_NETDEV
+	depends on EVL_NET
+	int "Maximum number of netdevices"
+	range 1 256
+	default 8
 	help
 
-	This value gives the maximum number of observable elements
-	which can live concurrently in the EVL core. Observables
-	enable the observer design pattern, in which any number of
-	observer threads can be notified of updates to any number of
-	observable subjects, in a loosely coupled fashion. An EVL
-	thread is in and of itself an observable which can be
-	monitored for events; observables attached to threads are not
-	accounted for in this value.
+	This value gives the maximum number of network devices which
+	can deal with out-of-band traffic.
 
 endmenu
 

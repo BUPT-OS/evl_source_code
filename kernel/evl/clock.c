@@ -34,8 +34,6 @@
 #include <evl/irq.h>
 #include <evl/uaccess.h>
 #include <asm/evl/calibration.h>
-#include <uapi/evl/factory.h>
-#include <uapi/evl/clock.h>
 #include <trace/events/evl.h>
 
 static const struct file_operations clock_fops;
@@ -85,7 +83,7 @@ static void adjust_timer(struct evl_clock *clock,
 		 */
 		div = ktime_divns(-diff, ktime_to_ns(period));
 		timer->periodic_ticks -= div;
-		timer->pexpect_ticks -= div;
+		timer->consumed_ticks -= div;
 		evl_update_timer_date(timer);
 	}
 
@@ -170,7 +168,7 @@ static int init_clock(struct evl_clock *clock, struct evl_clock *master)
 	 * usable. Make sure all inits have been completed before this
 	 * point.
 	 */
-	ret = evl_create_core_element_device(&clock->element,
+	ret = evl_create_element_device(&clock->element,
 					&evl_clock_factory,
 					clock->name);
 	if (ret) {
@@ -795,9 +793,16 @@ static long clock_common_ioctl(struct evl_clock *clock,
 
 	switch (cmd) {
 	case EVL_CLKIOC_GET_RES:
+		/*
+		 * Emulate the POSIX behavior which accepts a NULL
+		 * timespec for the purpose of validating the clock id
+		 * only, which we already did.
+		 */
+		u_uts = (typeof(u_uts))arg;
+		if (!u_uts)
+			return 0;
 		get_clock_resolution(clock, &ts64);
 		uts = timespec64_to_u_timespec(ts64);
-		u_uts = (typeof(u_uts))arg;
 		ret = raw_copy_to_user(u_uts, &uts,
 				sizeof(*u_uts)) ? -EFAULT : 0;
 		break;

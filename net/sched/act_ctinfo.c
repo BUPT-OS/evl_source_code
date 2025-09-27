@@ -18,6 +18,7 @@
 #include <net/pkt_cls.h>
 #include <uapi/linux/tc_act/tc_ctinfo.h>
 #include <net/tc_act/tc_ctinfo.h>
+#include <net/tc_wrapper.h>
 
 #include <net/netfilter/nf_conntrack.h>
 #include <net/netfilter/nf_conntrack_core.h>
@@ -75,8 +76,9 @@ static void tcf_ctinfo_cpmark_set(struct nf_conn *ct, struct tcf_ctinfo *ca,
 	skb->mark = READ_ONCE(ct->mark) & cp->cpmarkmask;
 }
 
-static int tcf_ctinfo_act(struct sk_buff *skb, const struct tc_action *a,
-			  struct tcf_result *res)
+TC_INDIRECT_SCOPE int tcf_ctinfo_act(struct sk_buff *skb,
+				     const struct tc_action *a,
+				     struct tcf_result *res)
 {
 	const struct nf_conntrack_tuple_hash *thash = NULL;
 	struct tcf_ctinfo *ca = to_ctinfo(a);
@@ -219,7 +221,7 @@ static int tcf_ctinfo_init(struct net *net, struct nlattr *nla,
 		ret = ACT_P_CREATED;
 	} else if (err > 0) {
 		if (bind) /* don't override defaults */
-			return 0;
+			return ACT_P_BOUND;
 		if (!(flags & TCA_ACT_FLAGS_REPLACE)) {
 			tcf_idr_release(*a, bind);
 			return -EEXIST;
@@ -361,6 +363,7 @@ static struct tc_action_ops act_ctinfo_ops = {
 	.cleanup= tcf_ctinfo_cleanup,
 	.size	= sizeof(struct tcf_ctinfo),
 };
+MODULE_ALIAS_NET_ACT("ctinfo");
 
 static __net_init int ctinfo_init_net(struct net *net)
 {

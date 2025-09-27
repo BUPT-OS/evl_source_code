@@ -30,7 +30,7 @@ struct virt_dma_chan {
 	struct virt_dma_lockops *lock_ops;
 	union {
 		spinlock_t lock;
-		hard_spinlock_t oob_lock;
+		hybrid_spinlock_t oob_lock;
 	};
 #else
 	spinlock_t lock;
@@ -192,6 +192,8 @@ static inline struct dma_async_tx_descriptor *vchan_tx_prep(struct virt_dma_chan
  */
 static inline bool vchan_issue_pending(struct virt_dma_chan *vc)
 {
+	lockdep_assert_held(&vc->lock);
+
 	list_splice_tail_init(&vc->desc_submitted, &vc->desc_issued);
 	return !list_empty(&vc->desc_issued);
 }
@@ -201,11 +203,18 @@ static inline bool vchan_issue_pending(struct virt_dma_chan *vc)
  * @vd: virtual descriptor to update
  *
  * vc.lock must be held by caller
+ *
+ * irq_pipeline: calling with hard irqs off is ok as long as we are
+ * running in-band from an interrupt context (i.e. in_interrupt()
+ * yields true), so that there is no attempt to wake up softirqd until
+ * the interrupt frame unwinds.
  */
 static inline void vchan_cookie_complete(struct virt_dma_desc *vd)
 {
 	struct virt_dma_chan *vc = to_virt_chan(vd->tx.chan);
 	dma_cookie_t cookie;
+
+	lockdep_assert_held(&vc->lock);
 
 	cookie = vd->tx.cookie;
 	dma_cookie_complete(&vd->tx);
@@ -257,6 +266,8 @@ static inline void vchan_terminate_vdesc(struct virt_dma_desc *vd)
 {
 	struct virt_dma_chan *vc = to_virt_chan(vd->tx.chan);
 
+	lockdep_assert_held(&vc->lock);
+
 	list_add_tail(&vd->node, &vc->desc_terminated);
 
 	if (vc->cyclic == vd)
@@ -271,6 +282,8 @@ static inline void vchan_terminate_vdesc(struct virt_dma_desc *vd)
  */
 static inline struct virt_dma_desc *vchan_next_desc(struct virt_dma_chan *vc)
 {
+	lockdep_assert_held(&vc->lock);
+
 	return list_first_entry_or_null(&vc->desc_issued,
 					struct virt_dma_desc, node);
 }
@@ -288,6 +301,8 @@ static inline struct virt_dma_desc *vchan_next_desc(struct virt_dma_chan *vc)
 static inline void vchan_get_all_descriptors(struct virt_dma_chan *vc,
 	struct list_head *head)
 {
+	lockdep_assert_held(&vc->lock);
+
 	list_splice_tail_init(&vc->desc_allocated, head);
 	list_splice_tail_init(&vc->desc_submitted, head);
 	list_splice_tail_init(&vc->desc_issued, head);

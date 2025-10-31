@@ -851,6 +851,13 @@ static inline void pl08x_put_phy_channel(struct pl08x_driver_data *pl08x,
 	ch->serving = NULL;
 }
 
+static inline bool pl08_dma_oob_capable(void)
+{
+	// return IS_ENABLED(CONFIG_PL08_DMAC_OOB);
+	//Kconfig is not modified for now
+	return true;
+}
+
 /*
  * Try to allocate a physical channel.  When successful, assign it to
  * this virtual channel, and initiate the next descriptor.  The
@@ -860,6 +867,7 @@ static void pl08x_phy_alloc_and_start(struct pl08x_dma_chan *plchan)
 {
 	struct pl08x_driver_data *pl08x = plchan->host;
 	struct pl08x_phy_chan *ch;
+	struct virt_dma_desc *vd;
 
 	ch = pl08x_get_phy_channel(pl08x, plchan);
 	if (!ch) {
@@ -874,7 +882,10 @@ static void pl08x_phy_alloc_and_start(struct pl08x_dma_chan *plchan)
 
 	plchan->phychan = ch;
 	plchan->state = PL08X_CHAN_RUNNING;
-	pl08x_start_next_txd(plchan);
+	vd = vchan_next_desc(&plchan->vc);
+	// pl08x_start_next_txd(plchan);
+	if(!pl08_dma_oob_capable() || !vchan_oob_pulsed(vd))//when oob is enable and desc is oob,desc is not triggered here
+		pl08x_start_next_txd(plchan);
 }
 
 static void pl08x_phy_reassign_start(struct pl08x_phy_chan *ch,
@@ -940,12 +951,14 @@ static void pl08x_phy_free(struct pl08x_dma_chan *plchan)
 		 * Eww.  We know this isn't going to deadlock
 		 * but lockdep probably doesn't.
 		 */
-		spin_lock(&next->vc.lock);
+		// spin_lock(&next->vc.lock);
+		vchan_lock(&next->vc);
 		/* Re-check the state now that we have the lock */
 		success = next->state == PL08X_CHAN_WAITING;
 		if (success)
 			pl08x_phy_reassign_start(plchan->phychan, next);
-		spin_unlock(&next->vc.lock);
+		// spin_unlock(&next->vc.lock);
+		vchan_unlock(&next->vc);
 
 		/* If the state changed, try to find another channel */
 		if (!success)
@@ -1563,7 +1576,8 @@ static enum dma_status pl08x_dma_tx_status(struct dma_chan *chan,
 		return ret;
 	}
 
-	spin_lock_irqsave(&plchan->vc.lock, flags);
+	// spin_lock_irqsave(&plchan->vc.lock, flags);
+	vchan_lock_irqsave(&plchan->vc,flags);
 	ret = dma_cookie_status(chan, cookie, txstate);
 	if (ret != DMA_COMPLETE) {
 		vd = vchan_find_desc(&plchan->vc, cookie);
@@ -1578,8 +1592,8 @@ static enum dma_status pl08x_dma_tx_status(struct dma_chan *chan,
 			bytes = pl08x_getbytes_chan(plchan);
 		}
 	}
-	spin_unlock_irqrestore(&plchan->vc.lock, flags);
-
+	// spin_unlock_irqrestore(&plchan->vc.lock, flags);
+	vchan_unlock_irqrestore(&plchan->vc,flags);
 	/*
 	 * This cookie not complete yet
 	 * Get number of bytes left in the active transactions and queue
@@ -1733,12 +1747,32 @@ static void pl08x_issue_pending(struct dma_chan *chan)
 	struct pl08x_dma_chan *plchan = to_pl08x_chan(chan);
 	unsigned long flags;
 
-	spin_lock_irqsave(&plchan->vc.lock, flags);
+	// spin_lock_irqsave(&plchan->vc.lock, flags);
+	vchan_lock_irqsave(&plchan->vc,flags);
 	if (vchan_issue_pending(&plchan->vc)) {
 		if (!plchan->phychan && plchan->state != PL08X_CHAN_WAITING)
 			pl08x_phy_alloc_and_start(plchan);
 	}
-	spin_unlock_irqrestore(&plchan->vc.lock, flags);
+	// spin_unlock_irqrestore(&plchan->vc.lock, flags);
+	vchan_unlock_irqrestore(&plchan->vc,flags);
+}
+
+static int pl08x_dma_pulse_oob(struct dma_chan *chan)
+{
+	struct pl08x_dma_chan *plchan = to_pl08x_chan(chan);
+	unsigned long flags;
+	struct virt_dma_desc *vd;
+	int ret = -EIO;
+
+	vchan_lock_irqsave(&plchan->vc, flags);	
+	vd = vchan_next_desc(&plchan->vc);
+	if (vd!=NULL && vchan_oob_pulsed(vd)) {
+		pl08x_start_next_txd(plchan);
+		ret = 0;
+	}
+	vchan_unlock_irqrestore(&plchan->vc, flags);
+
+	return ret;
 }
 
 static struct pl08x_txd *pl08x_get_txd(struct pl08x_dma_chan *plchan)
@@ -2050,6 +2084,14 @@ static struct dma_async_tx_descriptor *pl08x_prep_slave_sg(
 	int ret, tmp;
 	dma_addr_t slave_addr;
 
+	if(!pl08_dma_oob_capable()) {
+		if(flags & (DMA_OOB_INTERRUPT|DMA_OOB_PULSE)) {
+			dev_err(&pl08x->adev->dev,
+					"%s: out-of-band slave transfers disabled\n",
+					__func__);
+			return NULL;
+		}
+	}
 	dev_dbg(&pl08x->adev->dev, "%s prepare transaction of %d bytes from %s\n",
 			__func__, sg_dma_len(sgl), plchan->name);
 
@@ -2091,6 +2133,20 @@ static struct dma_async_tx_descriptor *pl08x_prep_dma_cyclic(
 	int ret, tmp;
 	dma_addr_t slave_addr;
 
+	//check flags
+	if(!pl08_dma_oob_capable()) {
+			if (flags & DMA_OOB_INTERRUPT) {
+					dev_err(&pl08x->adev->dev,
+							"%s: out-of-band cyclic transfers disabled\n",
+							__func__);
+					return NULL;
+			}
+	} else if(flags & DMA_OOB_PULSE) {
+			dev_err(&pl08x->adev->dev,
+					"%s: no pulse mode with out-of-band cyclic transfers\n",
+					__func__);
+			return NULL;
+	}
 	dev_dbg(&pl08x->adev->dev,
 		"%s prepare cyclic transaction of %zd/%zd bytes %s %s\n",
 		__func__, period_len, buf_len,
@@ -2155,9 +2211,11 @@ static int pl08x_terminate_all(struct dma_chan *chan)
 	struct pl08x_driver_data *pl08x = plchan->host;
 	unsigned long flags;
 
-	spin_lock_irqsave(&plchan->vc.lock, flags);
+	// spin_lock_irqsave(&plchan->vc.lock, flags);
+	vchan_lock_irqsave(&plchan->vc,flags);
 	if (!plchan->phychan && !plchan->at) {
-		spin_unlock_irqrestore(&plchan->vc.lock, flags);
+		// spin_unlock_irqrestore(&plchan->vc.lock, flags);
+		vchan_unlock_irqrestore(&plchan->vc,flags);
 		return 0;
 	}
 
@@ -2178,8 +2236,8 @@ static int pl08x_terminate_all(struct dma_chan *chan)
 	/* Dequeue jobs not yet fired as well */
 	pl08x_free_txd_list(pl08x, plchan);
 
-	spin_unlock_irqrestore(&plchan->vc.lock, flags);
-
+	// spin_unlock_irqrestore(&plchan->vc.lock, flags);
+	vchan_unlock_irqrestore(&plchan->vc,flags);
 	return 0;
 }
 
@@ -2199,16 +2257,19 @@ static int pl08x_pause(struct dma_chan *chan)
 	 * Anything succeeds on channels with no physical allocation and
 	 * no queued transfers.
 	 */
-	spin_lock_irqsave(&plchan->vc.lock, flags);
+	// spin_lock_irqsave(&plchan->vc.lock, flags);
+	vchan_lock_irqsave(&plchan->vc,flags);
 	if (!plchan->phychan && !plchan->at) {
-		spin_unlock_irqrestore(&plchan->vc.lock, flags);
+		// spin_unlock_irqrestore(&plchan->vc.lock, flags);
+		vchan_unlock_irqrestore(&plchan->vc,flags);
 		return 0;
 	}
 
 	pl08x_pause_phy_chan(plchan->phychan);
 	plchan->state = PL08X_CHAN_PAUSED;
 
-	spin_unlock_irqrestore(&plchan->vc.lock, flags);
+	// spin_unlock_irqrestore(&plchan->vc.lock, flags);
+	vchan_unlock_irqrestore(&plchan->vc,flags);
 
 	return 0;
 }
@@ -2222,17 +2283,19 @@ static int pl08x_resume(struct dma_chan *chan)
 	 * Anything succeeds on channels with no physical allocation and
 	 * no queued transfers.
 	 */
-	spin_lock_irqsave(&plchan->vc.lock, flags);
+	// spin_lock_irqsave(&plchan->vc.lock, flags);
+	vchan_lock_irqsave(&plchan->vc,flags);
 	if (!plchan->phychan && !plchan->at) {
-		spin_unlock_irqrestore(&plchan->vc.lock, flags);
+		// spin_unlock_irqrestore(&plchan->vc.lock, flags);
+		vchan_unlock_irqrestore(&plchan->vc,flags);
 		return 0;
 	}
 
 	pl08x_resume_phy_chan(plchan->phychan);
 	plchan->state = PL08X_CHAN_RUNNING;
 
-	spin_unlock_irqrestore(&plchan->vc.lock, flags);
-
+	// spin_unlock_irqrestore(&plchan->vc.lock, flags);
+	vchan_unlock_irqrestore(&plchan->vc,flags);
 	return 0;
 }
 
@@ -2281,20 +2344,60 @@ static void pl08x_ensure_on(struct pl08x_driver_data *pl08x)
 	writel(PL080_CONFIG_ENABLE, pl08x->base + PL080_CONFIG);
 }
 
+static bool do_channel(struct pl08x_txd *tx,struct pl08x_dma_chan *plchan)
+{
+	struct dmaengine_desc_callback cb;
+	//oob process
+	if(running_oob()){
+		if(!vchan_oob_handled(&tx->vd))
+			return false;//ib desc need to be forward
+		dmaengine_desc_get_callback(&tx->vd.tx,&cb);
+		if (dmaengine_desc_callback_valid(&cb)) {
+			vchan_unlock(&plchan->vc);
+			dmaengine_desc_callback_invoke(&cb, NULL);
+			vchan_lock(&plchan->vc);		
+		}
+		return true;
+	}
+	//ib process
+	if (tx && tx->cyclic) {
+		vchan_cyclic_callback(&tx->vd);
+	} else if (tx) {
+		plchan->at = NULL;
+		/*
+			* This descriptor is done, release its mux
+			* reservation.
+			*/
+		pl08x_release_mux(plchan);
+		tx->done = true;
+		vchan_cookie_complete(&tx->vd);
+
+		/*
+			* And start the next descriptor (if any),
+			* otherwise free this channel.
+			*/
+		if (vchan_next_desc(&plchan->vc))
+			pl08x_start_next_txd(plchan);
+		else
+			pl08x_phy_free(plchan);
+	}
+	return true;
+}
+
 static irqreturn_t pl08x_irq(int irq, void *dev)
 {
 	struct pl08x_driver_data *pl08x = dev;
 	u32 mask = 0, err, tc, i;
-
+	bool oob_need_forward = false;
 	/* check & clear - ERR & TC interrupts */
 	err = readl(pl08x->base + PL080_ERR_STATUS);
-	if (err) {
+	if (err && !running_oob()) {
 		dev_err(&pl08x->adev->dev, "%s error interrupt, register value 0x%08x\n",
 			__func__, err);
 		writel(err, pl08x->base + PL080_ERR_CLEAR);
 	}
 	tc = readl(pl08x->base + PL080_TC_STATUS);
-	if (tc)
+	if (tc && !running_oob())
 		writel(tc, pl08x->base + PL080_TC_CLEAR);
 
 	if (!err && !tc)
@@ -2306,44 +2409,47 @@ static irqreturn_t pl08x_irq(int irq, void *dev)
 			struct pl08x_phy_chan *phychan = &pl08x->phy_chans[i];
 			struct pl08x_dma_chan *plchan = phychan->serving;
 			struct pl08x_txd *tx;
+			//oob process 
 
 			if (!plchan) {
-				dev_err(&pl08x->adev->dev,
+				if(!running_oob()) {
+					dev_err(&pl08x->adev->dev,
 					"%s Error TC interrupt on unused channel: 0x%08x\n",
 					__func__, i);
+				}
 				continue;
 			}
 
-			spin_lock(&plchan->vc.lock);
+			// spin_lock(&plchan->vc.lock);
+			vchan_lock(&plchan->vc);			
 			tx = plchan->at;
-			if (tx && tx->cyclic) {
-				vchan_cyclic_callback(&tx->vd);
-			} else if (tx) {
-				plchan->at = NULL;
-				/*
-				 * This descriptor is done, release its mux
-				 * reservation.
-				 */
-				pl08x_release_mux(plchan);
-				tx->done = true;
-				vchan_cookie_complete(&tx->vd);
 
-				/*
-				 * And start the next descriptor (if any),
-				 * otherwise free this channel.
-				 */
-				if (vchan_next_desc(&plchan->vc))
-					pl08x_start_next_txd(plchan);
-				else
-					pl08x_phy_free(plchan);
+			if(pl08_dma_oob_capable() && running_oob()) {
+				if(!do_channel(tx,plchan)) {
+					oob_need_forward = true;
+				} else {
+					//oob process success,clear the corresponding tc and err bit
+					if((BIT(i) & err))
+						writel(BIT(i), pl08x->base + PL080_ERR_CLEAR);
+					if((BIT(i) & tc))
+						writel(BIT(i), pl08x->base + PL080_TC_CLEAR);
+				}
+			} else {
+				do_channel(tx,plchan);
 			}
-			spin_unlock(&plchan->vc.lock);
-
-			mask |= BIT(i);
+			// spin_unlock(&plchan->vc.lock);
+			vchan_unlock(&plchan->vc);
+			if(!running_oob())
+				mask |= BIT(i);
 		}
 	}
-
-	return mask ? IRQ_HANDLED : IRQ_NONE;
+	//在oob阶段：遍历所有待处理通道，根据do_channel,只要有任意一个是带内的无法处理，那么就需要return forward；反之返回handled
+	//在ib阶段，有mask返回handled，无mask返回none
+	if(running_oob()) {
+		return oob_need_forward ? IRQ_FORWARD : IRQ_HANDLED;
+	} else {
+		return mask ? IRQ_HANDLED : IRQ_NONE;
+	}
 }
 
 static void pl08x_dma_slave_init(struct pl08x_dma_chan *chan)
@@ -2782,6 +2888,7 @@ static int pl08x_probe(struct amba_device *adev, const struct amba_id *id)
 		pl08x->slave.device_issue_pending = pl08x_issue_pending;
 		pl08x->slave.device_prep_slave_sg = pl08x_prep_slave_sg;
 		pl08x->slave.device_prep_dma_cyclic = pl08x_prep_dma_cyclic;
+		pl08x->slave.device_pulse_oob = pl08x_dma_pulse_oob;
 		pl08x->slave.device_config = pl08x_config;
 		pl08x->slave.device_pause = pl08x_pause;
 		pl08x->slave.device_resume = pl08x_resume;
@@ -2908,6 +3015,7 @@ static int pl08x_probe(struct amba_device *adev, const struct amba_id *id)
 	}
 
 	/* Register as many memcpy channels as there are physical channels */
+	// dma_cap_set(DMA_OOB,pl08x->slave.cap_mask);//no oob for memcpy virt channels
 	ret = pl08x_dma_init_virtual_channels(pl08x, &pl08x->memcpy,
 					      pl08x->vd->channels, false);
 	if (ret <= 0) {
@@ -2918,6 +3026,7 @@ static int pl08x_probe(struct amba_device *adev, const struct amba_id *id)
 	}
 
 	/* Register slave channels */
+	dma_cap_set(DMA_OOB,pl08x->slave.cap_mask);
 	if (pl08x->has_slave) {
 		ret = pl08x_dma_init_virtual_channels(pl08x, &pl08x->slave,
 					pl08x->pd->num_slave_channels, true);
@@ -2952,7 +3061,8 @@ static int pl08x_probe(struct amba_device *adev, const struct amba_id *id)
 	dev_info(&pl08x->adev->dev, "DMA: PL%03x%s rev%u at 0x%08llx irq %d\n",
 		 amba_part(adev), pl08x->vd->pl080s ? "s" : "", amba_rev(adev),
 		 (unsigned long long)adev->res.start, adev->irq[0]);
-
+	
+	dev_info(&pl08x->adev->dev, "probe modify success\n");
 	return 0;
 
 out_no_slave_reg:
